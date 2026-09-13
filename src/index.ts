@@ -1166,6 +1166,37 @@ async function runSse(listenPort: number) {
 
   const sseTransports: Map<string, SSEServerTransport> = new Map();
 
+  // Static Server Card for Smithery & MCP Registries (SEP-1649)
+  const getServerCard = () => ({
+    $schema: "https://modelcontextprotocol.io/schema/server-card.json",
+    serverInfo: {
+      name: "Civify MCP Server",
+      version: "1.1.0",
+      description: "Official MCP server for Civify AI Career Platform (Resume Parsing, ATS Scoring, Tailoring, PII Masking, Kanban Applications, and Pay-Per-CV).",
+    },
+    authentication: {
+      required: false,
+      description: "Dynamic per-session authentication supported (civify_login, civify_register, or civify_set_api_key).",
+    },
+    configSchema: {
+      type: "object",
+      properties: {
+        apiKey: {
+          type: "string",
+          description: "Optional Civify Developer API key (cv-fy-...). If omitted, you can authenticate interactively in chat.",
+        },
+      },
+    },
+    tools: TOOLS,
+    resources: [],
+    prompts: [],
+  });
+
+  app.get(["/.well-known/mcp/server-card.json", "/server-card.json"], (req, res) => {
+    res.setHeader("Content-Type", "application/json");
+    res.json(getServerCard());
+  });
+
   app.get("/health", (req, res) => {
     res.json({
       status: "UP",
@@ -1177,24 +1208,13 @@ async function runSse(listenPort: number) {
     });
   });
 
-  app.get("/", (req, res) => {
-    res.json({
-      service: "Civify Model Context Protocol (MCP) Server",
-      version: "1.1.0",
-      homepage: "https://civify.cv",
-      docs: "https://civify.cv/developers/mcp",
-      endpoints: {
-        sse: "/sse",
-        messages: "/messages",
-        health: "/health",
-      },
-      toolsCount: TOOLS.length,
-      auth: "Dynamic per-session authentication supported (register, login, 2FA, or API key).",
-    });
-  });
+  const handleSse = async (req: express.Request, res: express.Response) => {
+    const initialKey =
+      (req.headers["x-api-key"] as string) ||
+      (req.headers["authorization"]?.replace(/^Bearer\s+/i, "") as string) ||
+      (req.query.apiKey as string) ||
+      undefined;
 
-  app.get("/sse", async (req, res) => {
-    const initialKey = (req.headers["x-api-key"] as string) || (req.query.apiKey as string) || undefined;
     const transport = new SSEServerTransport("/messages", res);
     const sessionId = transport.sessionId;
 
@@ -1211,14 +1231,42 @@ async function runSse(listenPort: number) {
     console.log(`[SSE] Session started: ${sessionId} (initial key: ${initialKey ? "provided" : "none"})`);
     const server = createMcpServer(sessionAuth);
     await server.connect(transport);
+  };
+
+  app.get("/sse", handleSse);
+
+  // If a client (or Smithery) connects to root `/` expecting SSE, stream SSE; otherwise return JSON discovery info
+  app.get("/", (req, res) => {
+    if (req.headers.accept?.includes("text/event-stream") || req.query.transport === "sse") {
+      return handleSse(req, res);
+    }
+
+    res.json({
+      service: "Civify Model Context Protocol (MCP) Server",
+      version: "1.1.0",
+      homepage: "https://civify.cv",
+      docs: "https://civify.cv/developers/mcp",
+      endpoints: {
+        sse: "/sse",
+        messages: "/messages",
+        health: "/health",
+        serverCard: "/.well-known/mcp/server-card.json",
+      },
+      toolsCount: TOOLS.length,
+      auth: "Dynamic per-session authentication supported (register, login, 2FA, or API key).",
+    });
   });
 
-  app.post("/messages", async (req, res) => {
-    const sessionId = String(req.query.sessionId || "");
+  app.post(["/messages", "/sse", "/"], async (req, res) => {
+    const sessionId = String(req.query.sessionId || req.body?.sessionId || "");
     const transport = sseTransports.get(sessionId);
 
     if (!transport) {
-      res.status(404).json({ error: `Session not found: ${sessionId}` });
+      if (!sessionId) {
+        res.status(400).json({ error: "Missing sessionId query parameter." });
+      } else {
+        res.status(404).json({ error: `Session not found: ${sessionId}` });
+      }
       return;
     }
 
@@ -1229,6 +1277,7 @@ async function runSse(listenPort: number) {
     console.log(`🚀 Civify Remote MCP Server running on port ${listenPort}`);
     console.log(`🔗 SSE endpoint: http://0.0.0.0:${listenPort}/sse`);
     console.log(`🩺 Healthcheck: http://0.0.0.0:${listenPort}/health`);
+    console.log(`📋 Server Card: http://0.0.0.0:${listenPort}/.well-known/mcp/server-card.json`);
   });
 }
 
