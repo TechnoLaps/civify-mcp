@@ -1079,7 +1079,7 @@ async function runSse(listenPort) {
             service: "Civify Model Context Protocol (MCP) Server",
             version: "1.1.0",
             homepage: "https://civify.cv",
-            docs: "https://civify.cv/developers/mcp",
+            docs: "https://civify.cv/mcp-docs",
             endpoints: {
                 sse: "/sse",
                 messages: "/messages",
