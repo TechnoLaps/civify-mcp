@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /**
  * Civify Model Context Protocol (MCP) Server
- * Exposes AI resume parsing, ATS scoring, tailoring, PII masking,
- * and application tracking tools to AI agents (Claude, Cursor, OpenCode, Qwen).
+ * Supports dual transport:
+ * 1. Stdio (Local desktop/CLI agents: Claude Desktop, Cursor, OpenCode)
+ * 2. Remote SSE (Cloud deployments: Dokploy / Docker behind Traefik at mcp.civify.cv)
  */
 export {};

@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  civify-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: civify-mcp-server
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - PORT=8080
+      - TRANSPORT=sse
+      - CIVIFY_API_URL=https://civify.cv/apis
+      # CIVIFY_API_KEY can be optionally provided here or dynamically passed by agents via headers/query
+      - CIVIFY_API_KEY=${CIVIFY_API_KEY:-}
+    networks:
+      - dokploy-network
+    labels:
+      # Traefik configuration for Dokploy
+      - "traefik.enable=true"
+      - "traefik.http.routers.civify-mcp.rule=Host(`mcp.civify.cv`)"
+      - "traefik.http.routers.civify-mcp.entrypoints=websecure"
+      - "traefik.http.routers.civify-mcp.tls.certresolver=letsencrypt"
+      - "traefik.http.services.civify-mcp.loadbalancer.server.port=8080"
+      # Enable Server-Sent Events (SSE) buffering bypass for Traefik
+      - "traefik.http.middlewares.mcp-compress.compress=false"
+      - "traefik.http.routers.civify-mcp.middlewares=mcp-compress"
+
+networks:
+  dokploy-network:
+    external: true

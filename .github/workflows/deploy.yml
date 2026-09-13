@@ -1,0 +1,48 @@
+name: Build & Deploy Civify MCP to Dokploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: Test & Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Compile TypeScript
+        run: npm run build
+
+  deploy-dokploy:
+    name: Deploy to Dokploy (Traefik)
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Trigger Dokploy Webhook
+        env:
+          DOKPLOY_WEBHOOK_URL: ${{ secrets.DOKPLOY_WEBHOOK_URL }}
+        run: |
+          if [ -n "$DOKPLOY_WEBHOOK_URL" ]; then
+            echo "Triggering Dokploy auto-deployment webhook..."
+            curl -X POST -f "$DOKPLOY_WEBHOOK_URL"
+            echo "Dokploy deployment triggered successfully!"
+          else
+            echo "DOKPLOY_WEBHOOK_URL secret is not configured in GitHub repository secrets."
+            echo "To enable automatic redeployment: add DOKPLOY_WEBHOOK_URL in GitHub Settings -> Secrets and variables -> Actions."
+          fi
