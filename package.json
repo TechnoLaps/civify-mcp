@@ -30,6 +30,7 @@
   "author": "Civify Engineering Team",
   "license": "MIT",
   "dependencies": {
+    "@civify/mcp-server": "file:",
     "@modelcontextprotocol/sdk": "^1.6.1",
     "axios": "^1.7.9",
     "cors": "^2.8.5",

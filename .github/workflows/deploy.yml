@@ -1,48 +1,75 @@
-name: Build & Deploy Civify MCP to Dokploy
+name: Deploy Civify MCP to Dokploy
 
 on:
   push:
     branches:
       - main
+      - Production
+      - Staging
   workflow_dispatch:
 
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
 jobs:
-  build-and-test:
-    name: Test & Build
+  build-and-deploy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
 
     steps:
-      - name: Checkout Code
+      # 1. Get the code
+      - name: Checkout code
         uses: actions/checkout@v4
 
+      # 2. Setup Node.js for pre-build checks & compile
       - name: Setup Node.js 22
         uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: 'npm'
 
-      - name: Install Dependencies
-        run: npm ci
-
-      - name: Compile TypeScript
-        run: npm run build
-
-  deploy-dokploy:
-    name: Deploy to Dokploy (Traefik)
-    needs: build-and-test
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-
-    steps:
-      - name: Trigger Dokploy Webhook
-        env:
-          DOKPLOY_WEBHOOK_URL: ${{ secrets.DOKPLOY_WEBHOOK_URL }}
+      - name: Install dependencies & verify compile
         run: |
-          if [ -n "$DOKPLOY_WEBHOOK_URL" ]; then
-            echo "Triggering Dokploy auto-deployment webhook..."
-            curl -X POST -f "$DOKPLOY_WEBHOOK_URL"
+          npm ci
+          npm run build
+
+      # 3. Log in to GitHub Container Registry
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 4. Lowercase Image Name
+      - name: Lowercase Image Name
+        run: |
+          echo "IMAGE_NAME=${IMAGE_NAME,,}" >>${GITHUB_ENV}
+
+      # 5. Build and push Docker Image
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      # 6. Trigger Dokploy to Pull and Deploy (mirrors civify backend deploy pipeline)
+      - name: Trigger Dokploy Deployment
+        run: |
+          WEBHOOK_URL="${{ secrets.DOKPLOY_WEBHOOK_MCP || secrets.DOKPLOY_WEBHOOK || secrets.DOKPLOY_WEBHOOK_URL }}"
+          if [ -n "$WEBHOOK_URL" ]; then
+            echo "Triggering Dokploy deployment webhook..."
+            curl -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d "{\"image\": \"${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}\"}"
             echo "Dokploy deployment triggered successfully!"
           else
-            echo "DOKPLOY_WEBHOOK_URL secret is not configured in GitHub repository secrets."
-            echo "To enable automatic redeployment: add DOKPLOY_WEBHOOK_URL in GitHub Settings -> Secrets and variables -> Actions."
+            echo "::warning::Neither DOKPLOY_WEBHOOK_MCP nor DOKPLOY_WEBHOOK is configured in repository secrets."
+            echo "Docker image was successfully built and pushed to: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
           fi
