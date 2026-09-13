@@ -1148,9 +1148,9 @@ async function runStdio() {
 async function runSse(listenPort: number) {
   const app = express();
   app.use(cors({ origin: "*" }));
+  app.use(express.json());
 
   const sseTransports: Map<string, SSEServerTransport> = new Map();
-  const sessionAuthMap: Map<string, SessionAuthState> = new Map();
 
   app.get("/health", (req, res) => {
     res.json({
@@ -1187,12 +1187,10 @@ async function runSse(listenPort: number) {
     const sessionAuth: SessionAuthState = {
       apiKey: initialKey,
     };
-    sessionAuthMap.set(sessionId, sessionAuth);
     sseTransports.set(sessionId, transport);
 
     transport.onclose = () => {
       sseTransports.delete(sessionId);
-      sessionAuthMap.delete(sessionId);
       console.log(`[SSE] Session closed: ${sessionId}`);
     };
 
