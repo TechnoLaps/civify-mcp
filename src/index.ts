@@ -31,6 +31,20 @@ import { fileURLToPath } from "url";
 import FormData from "form-data";
 import express from "express";
 import cors from "cors";
+import dns from "node:dns";
+
+// Optimize DNS resolution inside Docker/Alpine environments
+try {
+  dns.setDefaultResultOrder("ipv4first");
+} catch (_) {}
+
+if (process.env.DNS_SERVERS) {
+  try {
+    dns.setServers(process.env.DNS_SERVERS.split(",").map((s) => s.trim()));
+  } catch (e) {
+    console.error("[DNS] Failed to set custom DNS servers:", e);
+  }
+}
 
 const CIVIFY_BASE_URL = process.env.CIVIFY_API_URL || "https://civify.cv/apis";
 const CIVIFY_FRONTEND_URL = process.env.CIVIFY_FRONTEND_URL || "https://civify.cv";

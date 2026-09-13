@@ -33,6 +33,7 @@ ENV NODE_ENV=production
 ENV PORT=8080
 ENV TRANSPORT=sse
 ENV CIVIFY_API_URL=https://civify.cv/apis
+ENV DNS_SERVERS=8.8.8.8,1.1.1.1
 
 # Create non-root user for security
 RUN addgroup -g 1001 -S nodejs && \

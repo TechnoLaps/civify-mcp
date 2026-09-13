@@ -5,47 +5,55 @@
 
 Official [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server for the **[Civify Career Platform](https://civify.cv)**. 
 
-Connects autonomous AI agents (Claude Desktop, Cursor, OpenCode, Qwen CLI, custom agents) directly to Civify's AI resume parsing, ATS scoring, resume tailoring, PII redaction, and application tracking engines.
+Enables autonomous AI agents (Claude Desktop, Cursor, OpenCode, Qwen CLI, LibreChat, and custom agents) to directly interact with Civify's AI resume parsing, ATS scoring, resume tailoring, PII redaction, Pay-Per-CV monetization, and job application tracking engines.
 
 ---
 
-## ⚡ Quick Start
+## ⚡ Quick Start & Connection Options
 
-You do not need to install this package manually. AI clients can run it directly using `npx`:
+### Option A: Hosted Remote SSE (Recommended — Zero Install)
+Connect directly to Civify's managed cloud MCP server over Server-Sent Events (SSE):
+
+- **SSE URL:** `https://mcp.civify.cv/sse`
+- **Healthcheck:** `https://mcp.civify.cv/health`
+
+#### Claude Desktop / Remote SSE Client
+```json
+{
+  "mcpServers": {
+    "civify": {
+      "url": "https://mcp.civify.cv/sse"
+    }
+  }
+}
+```
+
+---
+
+### Option B: Local Command (npx / stdio)
+Run locally using Node.js without pre-installing:
 
 ```bash
 npx -y @civify/mcp-server
 ```
 
-### 1. Get your Civify API Key
-1. Sign in to your account at [https://civify.cv](https://civify.cv).
-2. Go to **Settings $\to$ API Keys** (`https://civify.cv/settings/api-keys`).
-3. Create an active API key (`cv-fy-...`).
-
----
-
-## 🛠️ Client Configuration
-
-### Claude Desktop
+#### Claude Desktop Configuration
 Edit your `claude_desktop_config.json`:
-- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
 
 ```json
 {
   "mcpServers": {
     "civify": {
       "command": "npx",
-      "args": ["-y", "@civify/mcp-server"],
-      "env": {
-        "CIVIFY_API_KEY": "cv-fy-your-api-key-here"
-      }
+      "args": ["-y", "@civify/mcp-server"]
     }
   }
 }
 ```
 
-### Cursor
+#### Cursor Configuration
 Add to your project's `.cursor/mcp.json`:
 
 ```json
@@ -53,95 +61,81 @@ Add to your project's `.cursor/mcp.json`:
   "mcpServers": {
     "civify": {
       "command": "npx",
-      "args": ["-y", "@civify/mcp-server"],
-      "env": {
-        "CIVIFY_API_KEY": "cv-fy-your-api-key-here"
-      }
+      "args": ["-y", "@civify/mcp-server"]
     }
   }
 }
 ```
 
-### OpenCode / CLI Agents
-Add to your `opencode.json` or run directly:
+#### OpenCode / Agent CLI
 ```bash
-CIVIFY_API_KEY="cv-fy-..." npx -y @civify/mcp-server
+npx -y @civify/mcp-server
 ```
 
 ---
 
-## 🧰 Available MCP Tools
+## 🔐 Dynamic Multi-User Authentication
 
-| Tool | Description | Key Arguments |
+No hardcoded or static API key is required at startup. The MCP server supports interactive, per-session authentication out of the box:
+
+1. **Sign In (`civify_login`):** Users can authenticate with their Civify email/username and password. The agent automatically retrieves a session key (with 2FA support via `civify_verify_2fa`).
+2. **Register (`civify_register`):** New users can create an account directly through the agent conversation.
+3. **Direct API Key (`civify_set_api_key`):** Users who already hold a developer key (`cv-fy-...`) can provide it at any point in the chat or configure `CIVIFY_API_KEY` in client settings.
+
+---
+
+## 🧰 Available Tools (17 Tools)
+
+### 1. Authentication & Profile
+| Tool | Description | Auth Required? |
+| :--- | :--- | :---: |
+| `civify_set_api_key` | Set or activate an existing Civify API key (`cv-fy-...`) for this session | No |
+| `civify_login` | Sign in with email/username and password; auto-provisions session key | No |
+| `civify_verify_2fa` | Complete two-factor authentication using the 6-digit email OTP | No |
+| `civify_register` | Register a new Civify account | No |
+| `civify_logout` | Clear active credentials and reset session state | No |
+| `civify_get_account` | Get profile, active plan, remaining AI tokens, and CV pass credits | Yes |
+
+### 2. Monetization & Pay-Per-CV
+| Tool | Description | Auth Required? |
+| :--- | :--- | :---: |
+| `civify_get_pay_per_cv_pricing` | Get localized Pay-Per-CV pricing (USD & EGP regional rates) | **Public (No)** |
+| `civify_purchase_cv_pass` | Purchase single CV pass or 3-pack (Card or Mobile Wallet) | Yes |
+| `civify_check_cv_entitlement` | Verify if a CV has an active 30-day unwatermarked pass and edit rights | Yes |
+
+### 3. Job Intelligence & Resume AI
+| Tool | Description | Auth Required? |
+| :--- | :--- | :---: |
+| `civify_scrape_job` | Scrape and extract requirements from job URLs (LinkedIn, Greenhouse, etc.) | **Public (No)** |
+| `civify_parse_cv` | Parse a PDF/DOCX/image resume into structured JSON schema | Yes |
+| `civify_tailor_cv` | Tailor bullet points against a target job description + cover letter generation | Yes |
+| `civify_score_ats` | Calculate ATS score and structural audit (document or JSON) | Yes |
+| `civify_mask_pii` | Redact sensitive personal contact information, export anonymized PDF | Yes |
+| `civify_generate_pdf` | Render high-fidelity PDF from structured resume data | No |
+
+### 4. Application Tracking (Kanban)
+| Tool | Description | Auth Required? |
+| :--- | :--- | :---: |
+| `civify_track_application` | Add a job application to the candidate's Kanban board | Yes |
+| `civify_list_applications` | List all tracked job applications with status and dates | Yes |
+
+---
+
+## ⚙️ Optional Environment Variables
+
+| Variable | Default | Description |
 | :--- | :--- | :--- |
-| `civify_parse_cv` | Parses a PDF, DOCX, or image resume into structured JSON | `file_path`, `language` |
-| `civify_tailor_cv` | Optimizes CV bullet points & keywords against a target JD | `file_path`, `job_description`, `job_title`, `generate_cover_letter` |
-| `civify_score_ats` | Calculates general 0–100 ATS compatibility score | `resume_id` |
-| `civify_mask_pii` | Sanitizes personal contact info for blind applications | `file_path` |
-| `civify_scrape_job` | Extracts clean job requirements from LinkedIn/Greenhouse URLs | `url` |
-| `civify_track_application` | Adds a job application to the user's Civify Kanban tracker | `company_name`, `job_title`, `status`, `job_url` |
-| `civify_get_account` | Checks token balance, subscription tier, and CV credits | *(none)* |
-| `civify_get_pay_per_cv_pricing` | Retrieves localized single CV unlock pricing (USD & EGP) | *(none)* |
+| `CIVIFY_API_KEY` | *(None)* | Pre-seeds a default API key for the session. Can also be set interactively via `civify_set_api_key` or `civify_login`. |
 
 ---
 
-## ⚙️ Environment Variables
+## 🌟 Registry Listings
 
-| Variable | Required | Default | Description |
-| :--- | :---: | :--- | :--- |
-| `CIVIFY_API_KEY` | **Yes** | `""` | Your Civify developer API key (`cv-fy-...`) |
-| `CIVIFY_API_URL` | No | `https://civify.cv/apis` | Civify backend API base URL |
-
----
-
-## 🚀 How to Publish to npm
-
-### Step 1: Login to npm
-Ensure you have an active npm account and are logged in via CLI:
-```bash
-npm login
-```
-
-### Step 2: Build the Package
-```bash
-npm run build
-```
-
-### Step 3: Publish to npm
-Since the package is scoped (`@civify`), publish with public access:
-```bash
-npm publish --access public
-```
-
-*(If you prefer an unscoped name like `civify-mcp`, update `"name": "civify-mcp"` in `package.json` before publishing).*
-
----
-
-## 🌐 How to Deploy Remote SSE Server (Docker / Cloud)
-
-For cloud agents that connect via Server-Sent Events (`sse`), you can deploy this server as a standalone HTTP service:
-
-### Dockerfile
-```dockerfile
-FROM node:22-alpine
-WORKDIR /app
-COPY package*.json tsconfig.json ./
-RUN npm ci
-COPY src/ ./src/
-RUN npm run build
-EXPOSE 8080
-CMD ["node", "dist/index.js"]
-```
-
----
-
-## 🌟 Registry Listings (Driving Agent Traffic)
-
-1. **Smithery**: Add your repo URL on [https://smithery.ai](https://smithery.ai) for 1-click install.
-2. **Glama**: Submit to [https://glama.ai/mcp/servers](https://glama.ai/mcp/servers).
-3. **PulseMCP**: List in the curated registry at [https://pulsemcp.com](https://pulsemcp.com).
+- **Smithery:** Add your repository URL on [https://smithery.ai](https://smithery.ai) for 1-click install.
+- **Glama:** List on [https://glama.ai/mcp/servers](https://glama.ai/mcp/servers).
+- **PulseMCP:** Listed in the curated registry at [https://pulsemcp.com](https://pulsemcp.com).
 
 ---
 
 ## 📄 License
-MIT © Civify Team
+MIT © [Civify Team](https://civify.cv)
