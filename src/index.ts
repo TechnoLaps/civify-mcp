@@ -811,7 +811,7 @@ export const createMcpServer = (sessionAuth: SessionAuthState) => {
 
         // ─── Get Pay-Per-CV Pricing ──────────────────────────────
         case "civify_get_pay_per_cv_pricing": {
-          const res = await axios.get(`${CIVIFY_BASE_URL}/v1/pay-per-cv/pricing`, {
+          const res = await axios.get(`${CIVIFY_BASE_URL}/v1/external/pay-per-cv/pricing`, {
             headers: { "User-Agent": "Civify-MCP-Server/1.1.0" },
           });
           return {
@@ -824,7 +824,7 @@ export const createMcpServer = (sessionAuth: SessionAuthState) => {
           const apiKey = ensureAuthenticated(sessionAuth, argApiKey);
           const client = getApiClient(sessionAuth, apiKey);
 
-          const res = await client.post("/v1/pay-per-cv/purchase", {
+          const res = await client.post("/v1/external/pay-per-cv/purchase", {
             productId: args?.product_id || "PAY_PER_CV_SINGLE",
             resumeId: args?.resume_id,
             gateway: args?.gateway,
@@ -845,7 +845,7 @@ export const createMcpServer = (sessionAuth: SessionAuthState) => {
           if (!resumeId) throw new Error("resume_id is required.");
 
           const client = getApiClient(sessionAuth, apiKey);
-          const res = await client.get(`/v1/pay-per-cv/status?resumeId=${encodeURIComponent(resumeId)}`);
+          const res = await client.get(`/v1/external/pay-per-cv/status?resumeId=${encodeURIComponent(resumeId)}`);
           return {
             content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }],
           };
@@ -857,7 +857,7 @@ export const createMcpServer = (sessionAuth: SessionAuthState) => {
           if (!url) throw new Error("url is required.");
 
           const client = getApiClient(sessionAuth, argApiKey);
-          const res = await client.post("/v1/job-applications/scrape-jd", { url });
+          const res = await client.post("/v1/external/cvs/scrape-jd", { url });
           return {
             content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }],
           };
@@ -952,7 +952,7 @@ export const createMcpServer = (sessionAuth: SessionAuthState) => {
             throw new Error("Either resume_data object or file_path document is required to calculate ATS score.");
           }
 
-          const res = await client.post("/v1/cvs/score", { resumeData });
+          const res = await client.post("/v1/external/cvs/score", { resumeData });
           return {
             content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }],
           };
@@ -1091,7 +1091,7 @@ export const createMcpServer = (sessionAuth: SessionAuthState) => {
           const apiKey = ensureAuthenticated(sessionAuth, argApiKey);
           const client = getApiClient(sessionAuth, apiKey);
 
-          const res = await client.post("/v1/job-applications", {
+          const res = await client.post("/v1/external/job-applications", {
             companyName: args?.company_name,
             jobTitle: args?.job_title,
             jobUrl: args?.job_url,
@@ -1108,7 +1108,7 @@ export const createMcpServer = (sessionAuth: SessionAuthState) => {
           const apiKey = ensureAuthenticated(sessionAuth, argApiKey);
           const client = getApiClient(sessionAuth, apiKey);
 
-          const res = await client.get("/v1/job-applications");
+          const res = await client.get("/v1/external/job-applications");
           return {
             content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }],
           };
