@@ -72,6 +72,98 @@ const ensureAuthenticated = (sessionAuth, overrideKey) => {
     }
     return key;
 };
+const renderProgressBar = (score) => {
+    const totalBlocks = 10;
+    const filled = Math.round((Math.max(0, Math.min(100, score)) / 100) * totalBlocks);
+    return "█".repeat(filled) + "░".repeat(totalBlocks - filled);
+};
+const getScoreTier = (score) => {
+    if (score >= 80)
+        return "🟢 Excellent Match";
+    if (score >= 65)
+        return "🟡 Good Potential";
+    return "🔴 Needs Optimization";
+};
+const formatAtsScoreMarkdown = (raw) => {
+    const data = raw?.data || raw;
+    const overall = Number(data?.overall || 0);
+    const keywordMatch = Number(data?.keywordMatch || 0);
+    const skillsMatch = Number(data?.skillsMatch || 0);
+    const missingKeywords = Array.isArray(data?.missingKeywords) ? data.missingKeywords : [];
+    const suggestions = Array.isArray(data?.suggestions) ? data.suggestions : [];
+    let md = `## 🎯 ATS Compatibility Score: ${overall}/100 [${renderProgressBar(overall)}] ${getScoreTier(overall)}\n\n`;
+    md += `| Evaluation Metric | Score | Assessment |\n`;
+    md += `| :--- | :---: | :--- |\n`;
+    md += `| **Overall ATS Compatibility** | **${overall}/100** | ${getScoreTier(overall)} |\n`;
+    md += `| **Keyword Match Rate** | ${keywordMatch}/100 | ${keywordMatch >= 75 ? "🟢 High Keyword Density" : "🟡 Gaps Detected"} |\n`;
+    md += `| **Skills Alignment** | ${skillsMatch}/100 | ${skillsMatch >= 75 ? "🟢 Strong Fit" : "🟡 Gaps Detected"} |\n\n`;
+    if (missingKeywords.length > 0) {
+        md += `### ⚠️ Missing Keywords from Target Job\n`;
+        md += missingKeywords.map((k) => `\`${k}\``).join(" • ") + `\n\n`;
+    }
+    if (suggestions.length > 0) {
+        md += `### 💡 Optimization Suggestions\n`;
+        suggestions.forEach((s, idx) => {
+            md += `${idx + 1}. ${s}\n`;
+        });
+        md += `\n`;
+    }
+    md += `### 🚀 Recommended Next Actions\n`;
+    md += `- **Tailor CV**: Run \`civify_tailor_cv\` with target job description to automatically fix keyword gaps.\n`;
+    md += `- **Export PDF**: Run \`civify_generate_pdf\` to export an ATS-compliant PDF.\n`;
+    return md;
+};
+const formatTailorCvMarkdown = (raw, jobTitle, companyName) => {
+    const data = raw?.data || raw;
+    const ats = data?.atsScore;
+    const origAts = data?.originalAtsScore;
+    const overall = ats?.overall != null ? Number(ats.overall) : null;
+    const origOverall = origAts?.overall != null ? Number(origAts.overall) : null;
+    const changes = Array.isArray(data?.changes) ? data.changes : [];
+    const warnings = Array.isArray(data?.validationWarnings) ? data.validationWarnings : [];
+    const missingKeywords = Array.isArray(ats?.missingKeywords) ? ats.missingKeywords : [];
+    let headerTitle = "## 🚀 Resume Tailoring Report";
+    if (jobTitle || companyName) {
+        headerTitle += ` for ${[jobTitle, companyName].filter(Boolean).join(" @ ")}`;
+    }
+    let md = `${headerTitle}\n\n`;
+    if (overall != null) {
+        let scoreLine = `**Tailored ATS Match:** ${overall}/100 [${renderProgressBar(overall)}] ${getScoreTier(overall)}`;
+        if (origOverall != null) {
+            const diff = overall - origOverall;
+            scoreLine += ` (improved from ${origOverall}/100 ${diff >= 0 ? `⬆️ +${diff}` : `⬇️ ${diff}`})`;
+        }
+        md += `${scoreLine}\n\n`;
+    }
+    if (changes.length > 0) {
+        md += `### 📝 Key Improvements Applied (${changes.length})\n`;
+        changes.forEach((c, idx) => {
+            md += `${idx + 1}. ${c}\n`;
+        });
+        md += `\n`;
+    }
+    if (missingKeywords.length > 0) {
+        md += `### ⚠️ Remaining Keyword Gaps\n`;
+        md += missingKeywords.map((k) => `\`${k}\``).join(" • ") + `\n\n`;
+    }
+    if (warnings.length > 0) {
+        md += `### ⚠️ Verification Warnings\n`;
+        warnings.forEach((w) => {
+            md += `- ${w}\n`;
+        });
+        md += `\n`;
+    }
+    if (data?.coverLetter) {
+        md += `### ✉️ Tailored Cover Letter Generated\n`;
+        md += `*(Cover letter text is available in the structured response below)*\n\n`;
+    }
+    md += `### 🎯 Next Steps\n`;
+    md += `1. **Render & Export**: Use \`civify_generate_pdf\` with the tailored resume data to export high-res PDF.\n`;
+    if (companyName || jobTitle) {
+        md += `2. **Track Application**: Use \`civify_track_application\` with company="${companyName || ""}", role="${jobTitle || ""}", status="APPLIED".\n`;
+    }
+    return md;
+};
 const TOOLS = [
     // ─── Authentication & Profile ──────────────────────────────────
     {
@@ -819,8 +911,12 @@ export const createMcpServer = (sessionAuth) => {
                     const res = await client.post("/v1/external/cvs/tailor", form, {
                         headers: form.getHeaders(),
                     });
+                    const mdReport = formatTailorCvMarkdown(res.data, args?.job_title ? String(args.job_title) : undefined, args?.company_name ? String(args.company_name) : undefined);
                     return {
-                        content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }],
+                        content: [
+                            { type: "text", text: mdReport },
+                            { type: "text", text: JSON.stringify(res.data, null, 2) },
+                        ],
                     };
                 }
                 // ─── Score ATS ───────────────────────────────────────────
@@ -844,8 +940,12 @@ export const createMcpServer = (sessionAuth) => {
                         throw new Error("Either resume_data object or file_path document is required to calculate ATS score.");
                     }
                     const res = await client.post("/v1/external/cvs/score", { resumeData });
+                    const mdScore = formatAtsScoreMarkdown(res.data);
                     return {
-                        content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }],
+                        content: [
+                            { type: "text", text: mdScore },
+                            { type: "text", text: JSON.stringify(res.data, null, 2) },
+                        ],
                     };
                 }
                 // ─── Mask PII ────────────────────────────────────────────
