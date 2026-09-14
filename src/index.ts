@@ -36,8 +36,16 @@ import FormData from "form-data";
 import express from "express";
 import cors from "cors";
 import dns from "node:dns";
+import { lookup as osLookup } from "node:dns";
+import http from "node:http";
+import https from "node:https";
 
-// Optimize DNS resolution inside Docker/Alpine environments
+// ─── DNS Hardening for Docker/Alpine ──────────────────────────────
+// Alpine's musl libc has unreliable DNS (EAI_AGAIN on civify.cv).
+// 1. Prefer IPv4 to avoid AAAA timeouts
+// 2. Set explicit DNS servers via env
+// 3. Force Axios to use Node.js resolver (dns.resolve4) which respects setServers(),
+//    instead of OS getaddrinfo which doesn't.
 try {
   dns.setDefaultResultOrder("ipv4first");
 } catch (_) {}
@@ -49,6 +57,32 @@ if (process.env.DNS_SERVERS) {
     console.error("[DNS] Failed to set custom DNS servers:", e);
   }
 }
+
+// Custom lookup: try Node.js dns.resolve4 first (uses setServers), fall back to OS
+const customLookup = (
+  hostname: string,
+  options: any,
+  callback: (err: NodeJS.ErrnoException | null, address: string, family: number) => void
+) => {
+  dns.resolve4(hostname, (err, addresses) => {
+    if (!err && addresses && addresses.length > 0) {
+      callback(null, addresses[0], 4);
+    } else {
+      // Fallback to OS resolver
+      osLookup(hostname, { family: 4 }, (err2, address) => {
+        callback(err2, address, 4);
+      });
+    }
+  });
+};
+
+// Apply custom DNS lookup to all HTTP/HTTPS requests (Axios uses these agents)
+const httpAgent = new http.Agent({ lookup: customLookup as any });
+const httpsAgent = new https.Agent({ lookup: customLookup as any });
+
+// Set as Axios defaults so bare axios.post/get (auth endpoints) also use custom DNS
+axios.defaults.httpAgent = httpAgent;
+axios.defaults.httpsAgent = httpsAgent;
 
 const CIVIFY_BASE_URL = process.env.CIVIFY_API_URL || "https://civify.cv/apis";
 const CIVIFY_FRONTEND_URL = process.env.CIVIFY_FRONTEND_URL || "https://civify.cv";
@@ -84,6 +118,8 @@ const getApiClient = (sessionAuth: SessionAuthState, overrideKey?: string): Axio
     baseURL: CIVIFY_BASE_URL,
     timeout: 90000,
     headers,
+    httpAgent,
+    httpsAgent,
   });
 };
 
