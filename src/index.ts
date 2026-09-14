@@ -50,6 +50,7 @@ const CIVIFY_BASE_URL = process.env.CIVIFY_API_URL || "https://civify.cv/apis";
 const CIVIFY_FRONTEND_URL = process.env.CIVIFY_FRONTEND_URL || "https://civify.cv";
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : null;
 const IS_SSE = process.argv.includes("--sse") || process.env.TRANSPORT === "sse" || PORT !== null;
+const SERVER_VERSION = "1.2.1";
 
 /**
  * Session Authentication State
@@ -66,7 +67,7 @@ export interface SessionAuthState {
 const getApiClient = (sessionAuth: SessionAuthState, overrideKey?: string): AxiosInstance => {
   const effectiveKey = overrideKey || sessionAuth.apiKey;
   const headers: Record<string, string> = {
-    "User-Agent": "Civify-MCP-Server/1.1.0",
+    "User-Agent": `Civify-MCP-Server/${SERVER_VERSION}`,
     Accept: "application/json",
   };
   if (effectiveKey) {
@@ -603,10 +604,11 @@ const TOOLS: Tool[] = [
     outputSchema: {
       type: "object",
       properties: {
+        content: { type: "string", description: "Raw scraped job description text content" },
         title: { type: "string", description: "Extracted job title" },
         company: { type: "string", description: "Hiring organization or employer name" },
         location: { type: "string", description: "Job location or Remote status" },
-        description: { type: "string", description: "Full cleaned job description text" },
+        description: { type: "string", description: "Cleaned job description text" },
         requirements: {
           type: "array",
           items: { type: "string" },
@@ -618,7 +620,6 @@ const TOOLS: Tool[] = [
           description: "Extracted day-to-day duties and responsibilities",
         },
       },
-      required: ["title", "description"],
     },
     annotations: {
       title: "Scrape Job Description URL",
@@ -664,6 +665,12 @@ const TOOLS: Tool[] = [
     outputSchema: {
       type: "object",
       properties: {
+        success: { type: "boolean", description: "Whether the document was successfully parsed" },
+        message: { type: "string", description: "Diagnostic or status message" },
+        resumeData: {
+          type: "object",
+          description: "Parsed resume sections including contact, experience, education, skills, and projects",
+        },
         contact: {
           type: "object",
           description: "Candidate contact information (name, email, phone, location, links)",
@@ -689,8 +696,8 @@ const TOOLS: Tool[] = [
           description: "Key projects and achievements",
           items: { type: "object" },
         },
+        detectedLanguage: { type: "string", description: "Primary detected language code (e.g., 'en', 'ar')" },
       },
-      required: ["contact", "experience", "skills"],
     },
     annotations: {
       title: "Parse Resume Document",
@@ -761,7 +768,8 @@ const TOOLS: Tool[] = [
     outputSchema: {
       type: "object",
       properties: {
-        status: { type: "string", description: "Execution status (SUCCESS)" },
+        status: { type: "string", description: "Execution status" },
+        tailoredCv: { type: "object", description: "Optimized resume document structure" },
         tailoredResume: { type: "object", description: "Optimized resume document structure" },
         atsScore: {
           type: "object",
@@ -773,14 +781,24 @@ const TOOLS: Tool[] = [
             missingKeywords: { type: "array", items: { type: "string" }, description: "Keywords still missing" },
           },
         },
+        originalAtsScore: {
+          type: "object",
+          description: "Original ATS score before tailoring for comparison",
+        },
         changes: {
           type: "array",
           items: { type: "string" },
           description: "Summary list of bullet points and sections tailored",
         },
+        validationWarnings: {
+          type: "array",
+          items: { type: "string" },
+          description: "Validation warnings or alignment notes",
+        },
         coverLetter: { type: "string", description: "Matching personalized cover letter text if requested" },
+        interviewPrep: { type: "object", description: "Targeted interview preparation questions and talking points" },
+        roadmap: { type: "object", description: "Targeted skill acquisition roadmap" },
       },
-      required: ["status"],
     },
     annotations: {
       title: "Tailor Resume to Job Description",
@@ -814,6 +832,12 @@ const TOOLS: Tool[] = [
     outputSchema: {
       type: "object",
       properties: {
+        success: { type: "boolean", description: "Operation success status" },
+        message: { type: "string", description: "Status message" },
+        data: {
+          type: "object",
+          description: "ATS score details containing overall, keywordMatch, skillsMatch, missingKeywords, and suggestions",
+        },
         overall: { type: "number", description: "Overall ATS match score (0-100)" },
         keywordMatch: { type: "number", description: "Keyword density and match score (0-100)" },
         skillsMatch: { type: "number", description: "Skills section alignment score (0-100)" },
@@ -828,7 +852,6 @@ const TOOLS: Tool[] = [
           description: "Actionable recommendations to improve ATS compatibility",
         },
       },
-      required: ["overall"],
     },
     annotations: {
       title: "Score Resume ATS Compatibility",
@@ -1021,7 +1044,7 @@ export const createMcpServer = (sessionAuth: SessionAuthState) => {
   const server = new Server(
     {
       name: "civify-mcp-server",
-      version: "1.2.1",
+      version: SERVER_VERSION,
     },
     {
       capabilities: {
@@ -1354,7 +1377,7 @@ export const createMcpServer = (sessionAuth: SessionAuthState) => {
         // ─── Get Pay-Per-CV Pricing ──────────────────────────────
         case "civify_get_pay_per_cv_pricing": {
           const res = await axios.get(`${CIVIFY_BASE_URL}/v1/external/pay-per-cv/pricing`, {
-            headers: { "User-Agent": "Civify-MCP-Server/1.1.0" },
+            headers: { "User-Agent": `Civify-MCP-Server/${SERVER_VERSION}` },
           });
           return {
             content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }],
@@ -1711,7 +1734,7 @@ async function runSse(listenPort: number) {
     $schema: "https://modelcontextprotocol.io/schema/server-card.json",
     serverInfo: {
       name: "Civify MCP Server",
-      version: "1.2.1",
+      version: SERVER_VERSION,
       description: "Official MCP server for Civify AI Career Platform (Resume Parsing, ATS Scoring, Tailoring, PII Masking, Kanban Applications, and Pay-Per-CV).",
     },
     authentication: {
@@ -1741,7 +1764,7 @@ async function runSse(listenPort: number) {
     res.json({
       status: "UP",
       service: "civify-mcp-server",
-      version: "1.2.1",
+      version: SERVER_VERSION,
       transport: "sse",
       activeSessions: sseTransports.size,
       timestamp: new Date().toISOString(),
@@ -1783,7 +1806,7 @@ async function runSse(listenPort: number) {
 
     res.json({
       service: "Civify Model Context Protocol (MCP) Server",
-      version: "1.2.1",
+      version: SERVER_VERSION,
       homepage: "https://civify.cv",
       docs: "https://civify.cv/mcp-docs",
       endpoints: {
