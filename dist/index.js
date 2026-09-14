@@ -1142,6 +1142,9 @@ export const createMcpServer = (sessionAuth) => {
                         },
                     });
                     const rawKey = keyRes.data?.key;
+                    if (!rawKey) {
+                        throw new Error("Failed to auto-generate Civify API key after 2FA verification.");
+                    }
                     sessionAuth.apiKey = rawKey;
                     try {
                         const profileRes = await axios.get(`${CIVIFY_BASE_URL}/v1/external/cvs/user/profile`, {
@@ -1561,6 +1564,28 @@ async function runSse(listenPort) {
     // Streamable HTTP transport sessions (new MCP standard)
     const streamableTransports = new Map();
     const streamableSessionAuths = new Map();
+    const streamableLastActivity = new Map();
+    // Periodic session TTL eviction (cleans up inactive sessions older than 2 hours)
+    const SESSION_TTL_MS = 2 * 60 * 60 * 1000;
+    const sessionCleanupTimer = setInterval(() => {
+        const now = Date.now();
+        for (const [sid, lastActive] of streamableLastActivity.entries()) {
+            if (now - lastActive > SESSION_TTL_MS) {
+                console.log(`[Streamable HTTP] Evicting idle session: ${sid}`);
+                const transport = streamableTransports.get(sid);
+                if (transport) {
+                    try {
+                        transport.close();
+                    }
+                    catch (_) { }
+                }
+                streamableTransports.delete(sid);
+                streamableSessionAuths.delete(sid);
+                streamableLastActivity.delete(sid);
+            }
+        }
+    }, 15 * 60 * 1000);
+    sessionCleanupTimer.unref();
     // Static Server Card for Smithery & MCP Registries (SEP-1649)
     const getServerCard = () => ({
         $schema: "https://modelcontextprotocol.io/schema/server-card.json",
@@ -1669,6 +1694,19 @@ async function runSse(listenPort) {
             if (sessionId && streamableTransports.has(sessionId)) {
                 // ── Reuse existing session ──
                 transport = streamableTransports.get(sessionId);
+                streamableLastActivity.set(sessionId, Date.now());
+            }
+            else if (sessionId && !streamableTransports.has(sessionId)) {
+                // ── Expired or unknown session ID (RFC compliant 404 for reconnection/retry) ──
+                res.status(404).json({
+                    jsonrpc: "2.0",
+                    error: {
+                        code: -32000,
+                        message: "Session not found or expired. Please send an initialize request without mcp-session-id header.",
+                    },
+                    id: null,
+                });
+                return;
             }
             else if (!sessionId && isInitializeRequest(req.body)) {
                 // ── New initialize request — create session ──
@@ -1681,6 +1719,7 @@ async function runSse(listenPort) {
                     onsessioninitialized: (newSessionId) => {
                         streamableTransports.set(newSessionId, transport);
                         streamableSessionAuths.set(newSessionId, sessionAuth);
+                        streamableLastActivity.set(newSessionId, Date.now());
                         console.log(`[Streamable HTTP] Session initialized: ${newSessionId} (key: ${initialKey ? "provided" : "none"})`);
                     },
                 });
@@ -1689,6 +1728,7 @@ async function runSse(listenPort) {
                     if (sid) {
                         streamableTransports.delete(sid);
                         streamableSessionAuths.delete(sid);
+                        streamableLastActivity.delete(sid);
                         console.log(`[Streamable HTTP] Session closed: ${sid}`);
                     }
                 };
@@ -1730,6 +1770,7 @@ async function runSse(listenPort) {
         const sessionId = req.headers["mcp-session-id"];
         if (sessionId && streamableTransports.has(sessionId)) {
             const transport = streamableTransports.get(sessionId);
+            streamableLastActivity.set(sessionId, Date.now());
             await transport.handleRequest(req, res);
         }
         else {
@@ -1744,6 +1785,7 @@ async function runSse(listenPort) {
             await transport.handleRequest(req, res);
             streamableTransports.delete(sessionId);
             streamableSessionAuths.delete(sessionId);
+            streamableLastActivity.delete(sessionId);
             console.log(`[Streamable HTTP] Session terminated by client: ${sessionId}`);
         }
         else {

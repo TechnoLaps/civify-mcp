@@ -1236,6 +1236,9 @@ export const createMcpServer = (sessionAuth: SessionAuthState) => {
           );
 
           const rawKey = keyRes.data?.key;
+          if (!rawKey) {
+            throw new Error("Failed to auto-generate Civify API key after 2FA verification.");
+          }
           sessionAuth.apiKey = rawKey;
 
           try {
@@ -1737,6 +1740,28 @@ async function runSse(listenPort: number) {
   // Streamable HTTP transport sessions (new MCP standard)
   const streamableTransports: Map<string, StreamableHTTPServerTransport> = new Map();
   const streamableSessionAuths: Map<string, SessionAuthState> = new Map();
+  const streamableLastActivity: Map<string, number> = new Map();
+
+  // Periodic session TTL eviction (cleans up inactive sessions older than 2 hours)
+  const SESSION_TTL_MS = 2 * 60 * 60 * 1000;
+  const sessionCleanupTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [sid, lastActive] of streamableLastActivity.entries()) {
+      if (now - lastActive > SESSION_TTL_MS) {
+        console.log(`[Streamable HTTP] Evicting idle session: ${sid}`);
+        const transport = streamableTransports.get(sid);
+        if (transport) {
+          try {
+            transport.close();
+          } catch (_) {}
+        }
+        streamableTransports.delete(sid);
+        streamableSessionAuths.delete(sid);
+        streamableLastActivity.delete(sid);
+      }
+    }
+  }, 15 * 60 * 1000);
+  sessionCleanupTimer.unref();
 
   // Static Server Card for Smithery & MCP Registries (SEP-1649)
   const getServerCard = () => ({
@@ -1861,6 +1886,18 @@ async function runSse(listenPort: number) {
       if (sessionId && streamableTransports.has(sessionId)) {
         // ── Reuse existing session ──
         transport = streamableTransports.get(sessionId)!;
+        streamableLastActivity.set(sessionId, Date.now());
+      } else if (sessionId && !streamableTransports.has(sessionId)) {
+        // ── Expired or unknown session ID (RFC compliant 404 for reconnection/retry) ──
+        res.status(404).json({
+          jsonrpc: "2.0",
+          error: {
+            code: -32000,
+            message: "Session not found or expired. Please send an initialize request without mcp-session-id header.",
+          },
+          id: null,
+        });
+        return;
       } else if (!sessionId && isInitializeRequest(req.body)) {
         // ── New initialize request — create session ──
         const initialKey =
@@ -1875,6 +1912,7 @@ async function runSse(listenPort: number) {
           onsessioninitialized: (newSessionId) => {
             streamableTransports.set(newSessionId, transport!);
             streamableSessionAuths.set(newSessionId, sessionAuth);
+            streamableLastActivity.set(newSessionId, Date.now());
             console.log(`[Streamable HTTP] Session initialized: ${newSessionId} (key: ${initialKey ? "provided" : "none"})`);
           },
         });
@@ -1884,6 +1922,7 @@ async function runSse(listenPort: number) {
           if (sid) {
             streamableTransports.delete(sid);
             streamableSessionAuths.delete(sid);
+            streamableLastActivity.delete(sid);
             console.log(`[Streamable HTTP] Session closed: ${sid}`);
           }
         };
@@ -1927,6 +1966,7 @@ async function runSse(listenPort: number) {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
     if (sessionId && streamableTransports.has(sessionId)) {
       const transport = streamableTransports.get(sessionId)!;
+      streamableLastActivity.set(sessionId, Date.now());
       await transport.handleRequest(req, res);
     } else {
       res.status(405).set("Allow", "POST, DELETE").send("Method Not Allowed");
@@ -1941,6 +1981,7 @@ async function runSse(listenPort: number) {
       await transport.handleRequest(req, res);
       streamableTransports.delete(sessionId);
       streamableSessionAuths.delete(sessionId);
+      streamableLastActivity.delete(sessionId);
       console.log(`[Streamable HTTP] Session terminated by client: ${sessionId}`);
     } else {
       res.status(404).json({ error: "Session not found" });
