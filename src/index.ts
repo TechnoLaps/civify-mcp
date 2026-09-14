@@ -493,7 +493,7 @@ export const createMcpServer = (sessionAuth: SessionAuthState) => {
   const server = new Server(
     {
       name: "civify-mcp-server",
-      version: "1.1.0",
+      version: "1.2.0",
     },
     {
       capabilities: {
@@ -1171,7 +1171,7 @@ async function runSse(listenPort: number) {
     $schema: "https://modelcontextprotocol.io/schema/server-card.json",
     serverInfo: {
       name: "Civify MCP Server",
-      version: "1.1.0",
+      version: "1.2.0",
       description: "Official MCP server for Civify AI Career Platform (Resume Parsing, ATS Scoring, Tailoring, PII Masking, Kanban Applications, and Pay-Per-CV).",
     },
     authentication: {
@@ -1201,7 +1201,7 @@ async function runSse(listenPort: number) {
     res.json({
       status: "UP",
       service: "civify-mcp-server",
-      version: "1.1.0",
+      version: "1.2.0",
       transport: "sse",
       activeSessions: sseTransports.size,
       timestamp: new Date().toISOString(),
@@ -1243,7 +1243,7 @@ async function runSse(listenPort: number) {
 
     res.json({
       service: "Civify Model Context Protocol (MCP) Server",
-      version: "1.1.0",
+      version: "1.2.0",
       homepage: "https://civify.cv",
       docs: "https://civify.cv/mcp-docs",
       endpoints: {
