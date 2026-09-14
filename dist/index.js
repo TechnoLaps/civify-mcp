@@ -168,6 +168,7 @@ const TOOLS = [
     // ─── Authentication & Profile ──────────────────────────────────
     {
         name: "civify_set_api_key",
+        title: "Set Civify API Key",
         description: "Set or switch the active Civify API key for this agent session. Validates the key with the server immediately.",
         inputSchema: {
             type: "object",
@@ -179,9 +180,35 @@ const TOOLS = [
             },
             required: ["api_key"],
         },
+        outputSchema: {
+            type: "object",
+            properties: {
+                status: { type: "string", description: "Authentication status (AUTHENTICATED)" },
+                message: { type: "string", description: "Confirmation message" },
+                user: {
+                    type: "object",
+                    description: "Authenticated user profile details",
+                    properties: {
+                        id: { type: "string", description: "User ID" },
+                        email: { type: "string", description: "User email address" },
+                        username: { type: "string", description: "User account username" },
+                        subscriptionTier: { type: "string", description: "Subscription tier level" },
+                    },
+                },
+            },
+            required: ["status", "message"],
+        },
+        annotations: {
+            title: "Set Civify API Key",
+            readOnlyHint: false,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false,
+        },
     },
     {
         name: "civify_login",
+        title: "Sign In to Civify",
         description: "Sign in to Civify with email/username and password. Automatically exchanges JWT tokens for a personal API key and activates it for the session (same flow as Civify Chrome Extension).",
         inputSchema: {
             type: "object",
@@ -197,9 +224,37 @@ const TOOLS = [
             },
             required: ["identifier", "password"],
         },
+        outputSchema: {
+            type: "object",
+            properties: {
+                status: { type: "string", description: "Authentication status (AUTHENTICATED or 2FA_REQUIRED)" },
+                message: { type: "string", description: "Status message" },
+                apiKeyPreview: { type: "string", description: "Masked preview of the auto-generated API key" },
+                username: { type: "string", description: "Username for pending 2FA verification" },
+                action_required: { type: "string", description: "Next action required if 2FA is needed" },
+                user: {
+                    type: "object",
+                    description: "User profile information",
+                    properties: {
+                        id: { type: "string", description: "User ID" },
+                        email: { type: "string", description: "User email" },
+                        username: { type: "string", description: "User username" },
+                    },
+                },
+            },
+            required: ["status", "message"],
+        },
+        annotations: {
+            title: "Sign In to Civify",
+            readOnlyHint: false,
+            destructiveHint: false,
+            idempotentHint: false,
+            openWorldHint: false,
+        },
     },
     {
         name: "civify_verify_2fa",
+        title: "Verify 2FA Code",
         description: "Complete two-factor authentication (2FA) by submitting the OTP code sent to the user's email after login.",
         inputSchema: {
             type: "object",
@@ -215,9 +270,35 @@ const TOOLS = [
             },
             required: ["code"],
         },
+        outputSchema: {
+            type: "object",
+            properties: {
+                status: { type: "string", description: "Authentication status (AUTHENTICATED)" },
+                message: { type: "string", description: "Status confirmation message" },
+                apiKeyPreview: { type: "string", description: "Masked preview of the provisioned API key" },
+                user: {
+                    type: "object",
+                    description: "Authenticated user profile",
+                    properties: {
+                        id: { type: "string", description: "User ID" },
+                        email: { type: "string", description: "User email" },
+                        username: { type: "string", description: "User username" },
+                    },
+                },
+            },
+            required: ["status", "message"],
+        },
+        annotations: {
+            title: "Verify 2FA Code",
+            readOnlyHint: false,
+            destructiveHint: false,
+            idempotentHint: false,
+            openWorldHint: false,
+        },
     },
     {
         name: "civify_register",
+        title: "Register Civify Account",
         description: "Register a brand-new Civify account. If auto-verification is active, immediately provisions an API key for the session.",
         inputSchema: {
             type: "object",
@@ -241,17 +322,51 @@ const TOOLS = [
             },
             required: ["email", "password", "username"],
         },
+        outputSchema: {
+            type: "object",
+            properties: {
+                status: { type: "string", description: "Registration status (AUTHENTICATED or REGISTERED_VERIFICATION_REQUIRED)" },
+                message: { type: "string", description: "Status message" },
+                apiKeyPreview: { type: "string", description: "Masked preview of API key if auto-verified" },
+                action_required: { type: "string", description: "Next step required if email verification link was sent" },
+            },
+            required: ["status", "message"],
+        },
+        annotations: {
+            title: "Register Civify Account",
+            readOnlyHint: false,
+            destructiveHint: false,
+            idempotentHint: false,
+            openWorldHint: false,
+        },
     },
     {
         name: "civify_logout",
+        title: "Log Out of Civify",
         description: "Log out and clear active authentication credentials from this session.",
         inputSchema: {
             type: "object",
             properties: {},
         },
+        outputSchema: {
+            type: "object",
+            properties: {
+                status: { type: "string", description: "Status code (LOGGED_OUT)" },
+                message: { type: "string", description: "Confirmation message" },
+            },
+            required: ["status", "message"],
+        },
+        annotations: {
+            title: "Log Out of Civify",
+            readOnlyHint: false,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false,
+        },
     },
     {
         name: "civify_get_account",
+        title: "Get Account Profile & Quotas",
         description: "Get current authenticated user account profile, subscription tier, remaining AI token balance, and CV credits.",
         inputSchema: {
             type: "object",
@@ -262,18 +377,73 @@ const TOOLS = [
                 },
             },
         },
+        outputSchema: {
+            type: "object",
+            properties: {
+                id: { type: "string", description: "User ID" },
+                username: { type: "string", description: "Username" },
+                email: { type: "string", description: "Account email address" },
+                subscriptionTier: { type: "string", description: "Subscription plan (FREE, PRO, PREMIUM, ENTERPRISE)" },
+                aiTokensBalance: { type: "number", description: "Remaining AI token balance" },
+                creditsBalance: { type: "number", description: "Remaining CV credits balance" },
+            },
+        },
+        annotations: {
+            title: "Get Account Profile & Quotas",
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false,
+        },
     },
     // ─── Monetization & Pay-Per-CV ─────────────────────────────────
     {
         name: "civify_get_pay_per_cv_pricing",
+        title: "Get Pay-Per-CV Pricing",
         description: "Get public localized Pay-Per-CV pricing (USD base price, converted EGP regional pricing, exchange rates, and entitlement details). Public, no auth required.",
         inputSchema: {
             type: "object",
             properties: {},
         },
+        outputSchema: {
+            type: "object",
+            properties: {
+                currency: { type: "string", description: "Default base currency (USD)" },
+                regionalCurrency: { type: "string", description: "Localized currency detected from GeoIP (e.g. EGP)" },
+                exchangeRate: { type: "number", description: "Current currency exchange rate applied" },
+                products: {
+                    type: "array",
+                    description: "Available Pay-Per-CV packages",
+                    items: {
+                        type: "object",
+                        properties: {
+                            id: { type: "string", description: "Product ID (PAY_PER_CV_SINGLE or PAY_PER_CV_PACK3)" },
+                            name: { type: "string", description: "Product display name" },
+                            priceUsd: { type: "number", description: "Base price in USD" },
+                            priceRegional: { type: "number", description: "Converted regional price in localized currency" },
+                            features: {
+                                type: "array",
+                                items: { type: "string" },
+                                description: "List of included package features and benefits",
+                            },
+                        },
+                        required: ["id", "priceUsd"],
+                    },
+                },
+            },
+            required: ["currency", "products"],
+        },
+        annotations: {
+            title: "Get Pay-Per-CV Pricing",
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false,
+        },
     },
     {
         name: "civify_purchase_cv_pass",
+        title: "Initiate Pay-Per-CV Purchase",
         description: "Initiate checkout for a Pay-Per-CV unlock pass (single CV or 3-pack). Returns payment URL, invoice ID, and amount.",
         inputSchema: {
             type: "object",
@@ -312,9 +482,29 @@ const TOOLS = [
                 },
             },
         },
+        outputSchema: {
+            type: "object",
+            properties: {
+                invoiceId: { type: "string", description: "Unique transaction invoice reference" },
+                paymentUrl: { type: "string", description: "Direct checkout or payment redirect URL" },
+                amount: { type: "number", description: "Total charge amount" },
+                currency: { type: "string", description: "Charge currency code (USD or EGP)" },
+                gateway: { type: "string", description: "Assigned payment gateway (paymob, fawaterak, dodo)" },
+                status: { type: "string", description: "Initial order status (PENDING)" },
+            },
+            required: ["invoiceId", "paymentUrl"],
+        },
+        annotations: {
+            title: "Initiate Pay-Per-CV Purchase",
+            readOnlyHint: false,
+            destructiveHint: false,
+            idempotentHint: false,
+            openWorldHint: true,
+        },
     },
     {
         name: "civify_check_cv_entitlement",
+        title: "Check Resume Pass Entitlement",
         description: "Check if a specific resume currently has an active 30-day unwatermarked pass and unlimited edits.",
         inputSchema: {
             type: "object",
@@ -330,10 +520,29 @@ const TOOLS = [
             },
             required: ["resume_id"],
         },
+        outputSchema: {
+            type: "object",
+            properties: {
+                resumeId: { type: "string", description: "ID of the checked resume" },
+                hasActivePass: { type: "boolean", description: "Whether the resume has an active 30-day unwatermarked pass" },
+                expiresAt: { type: "string", description: "ISO timestamp when the active pass expires" },
+                canDownloadUnwatermarked: { type: "boolean", description: "Permission to export PDF without watermark" },
+                unlimitedEditsRemainingDays: { type: "number", description: "Remaining days of unlimited editing" },
+            },
+            required: ["resumeId", "hasActivePass"],
+        },
+        annotations: {
+            title: "Check Resume Pass Entitlement",
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false,
+        },
     },
     // ─── Job Intelligence & Scraping ──────────────────────────────
     {
         name: "civify_scrape_job",
+        title: "Scrape Job Description URL",
         description: "Scrape and extract structured job description, company name, requirements, and responsibilities from a job URL (LinkedIn, Greenhouse, Lever, Ashby, Wuzzuf, etc.).",
         inputSchema: {
             type: "object",
@@ -349,10 +558,38 @@ const TOOLS = [
             },
             required: ["url"],
         },
+        outputSchema: {
+            type: "object",
+            properties: {
+                title: { type: "string", description: "Extracted job title" },
+                company: { type: "string", description: "Hiring organization or employer name" },
+                location: { type: "string", description: "Job location or Remote status" },
+                description: { type: "string", description: "Full cleaned job description text" },
+                requirements: {
+                    type: "array",
+                    items: { type: "string" },
+                    description: "Extracted job requirements and qualifications",
+                },
+                responsibilities: {
+                    type: "array",
+                    items: { type: "string" },
+                    description: "Extracted day-to-day duties and responsibilities",
+                },
+            },
+            required: ["title", "description"],
+        },
+        annotations: {
+            title: "Scrape Job Description URL",
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: true,
+        },
     },
     // ─── Resume AI Processing ──────────────────────────────────────
     {
         name: "civify_parse_cv",
+        title: "Parse Resume Document",
         description: "Parse a resume document (PDF, DOCX, image) into structured JSON schema containing contact details, work experience, education, skills, and projects.",
         inputSchema: {
             type: "object",
@@ -381,9 +618,48 @@ const TOOLS = [
                 },
             },
         },
+        outputSchema: {
+            type: "object",
+            properties: {
+                contact: {
+                    type: "object",
+                    description: "Candidate contact information (name, email, phone, location, links)",
+                },
+                summary: { type: "string", description: "Professional summary statement" },
+                experience: {
+                    type: "array",
+                    description: "Chronological employment history",
+                    items: { type: "object" },
+                },
+                education: {
+                    type: "array",
+                    description: "Academic degrees and certifications",
+                    items: { type: "object" },
+                },
+                skills: {
+                    type: "array",
+                    description: "Technical and domain skills extracted",
+                    items: { type: "string" },
+                },
+                projects: {
+                    type: "array",
+                    description: "Key projects and achievements",
+                    items: { type: "object" },
+                },
+            },
+            required: ["contact", "experience", "skills"],
+        },
+        annotations: {
+            title: "Parse Resume Document",
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false,
+        },
     },
     {
         name: "civify_tailor_cv",
+        title: "Tailor Resume to Job Description",
         description: "Tailor a candidate's resume against a target job description using AI. Generates optimized bullet points, highlights matching skills, provides ATS keyword audit, and creates an optional cover letter.",
         inputSchema: {
             type: "object",
@@ -439,9 +715,41 @@ const TOOLS = [
             },
             required: ["job_description"],
         },
+        outputSchema: {
+            type: "object",
+            properties: {
+                status: { type: "string", description: "Execution status (SUCCESS)" },
+                tailoredResume: { type: "object", description: "Optimized resume document structure" },
+                atsScore: {
+                    type: "object",
+                    description: "Audit score for tailored version",
+                    properties: {
+                        overall: { type: "number", description: "Overall score 0-100" },
+                        keywordMatch: { type: "number", description: "Keyword match score 0-100" },
+                        skillsMatch: { type: "number", description: "Skills match score 0-100" },
+                        missingKeywords: { type: "array", items: { type: "string" }, description: "Keywords still missing" },
+                    },
+                },
+                changes: {
+                    type: "array",
+                    items: { type: "string" },
+                    description: "Summary list of bullet points and sections tailored",
+                },
+                coverLetter: { type: "string", description: "Matching personalized cover letter text if requested" },
+            },
+            required: ["status"],
+        },
+        annotations: {
+            title: "Tailor Resume to Job Description",
+            readOnlyHint: false,
+            destructiveHint: false,
+            idempotentHint: false,
+            openWorldHint: false,
+        },
     },
     {
         name: "civify_score_ats",
+        title: "Score Resume ATS Compatibility",
         description: "Calculate ATS compatibility score and structural audit for a resume document (file path) or structured resume JSON without needing a job description.",
         inputSchema: {
             type: "object",
@@ -460,9 +768,36 @@ const TOOLS = [
                 },
             },
         },
+        outputSchema: {
+            type: "object",
+            properties: {
+                overall: { type: "number", description: "Overall ATS match score (0-100)" },
+                keywordMatch: { type: "number", description: "Keyword density and match score (0-100)" },
+                skillsMatch: { type: "number", description: "Skills section alignment score (0-100)" },
+                missingKeywords: {
+                    type: "array",
+                    items: { type: "string" },
+                    description: "Important keywords missing from the resume",
+                },
+                suggestions: {
+                    type: "array",
+                    items: { type: "string" },
+                    description: "Actionable recommendations to improve ATS compatibility",
+                },
+            },
+            required: ["overall"],
+        },
+        annotations: {
+            title: "Score Resume ATS Compatibility",
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false,
+        },
     },
     {
         name: "civify_mask_pii",
+        title: "Mask Personally Identifiable Information",
         description: "Sanitize and redact sensitive PII (email, phone, physical address) from a CV document, exporting an anonymized PDF.",
         inputSchema: {
             type: "object",
@@ -485,9 +820,27 @@ const TOOLS = [
                 },
             },
         },
+        outputSchema: {
+            type: "object",
+            properties: {
+                status: { type: "string", description: "Redaction status (SUCCESS)" },
+                message: { type: "string", description: "Details on the exported sanitized document" },
+                path: { type: "string", description: "Filesystem path to saved masked PDF" },
+                pdf_base64: { type: "string", description: "Base64 encoded masked PDF if saved to memory" },
+            },
+            required: ["status", "message"],
+        },
+        annotations: {
+            title: "Mask Personally Identifiable Information",
+            readOnlyHint: false,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false,
+        },
     },
     {
         name: "civify_generate_pdf",
+        title: "Render Resume PDF",
         description: "Render and generate a high-fidelity PDF from structured resume data using Civify's template engine.",
         inputSchema: {
             type: "object",
@@ -518,10 +871,28 @@ const TOOLS = [
             },
             required: ["resume_data"],
         },
+        outputSchema: {
+            type: "object",
+            properties: {
+                status: { type: "string", description: "Export status (SUCCESS)" },
+                message: { type: "string", description: "Confirmation message" },
+                path: { type: "string", description: "Filesystem path to the exported PDF document" },
+                pdf_base64: { type: "string", description: "Base64 encoded PDF document" },
+            },
+            required: ["status", "message"],
+        },
+        annotations: {
+            title: "Render Resume PDF",
+            readOnlyHint: false,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false,
+        },
     },
     // ─── Application Tracking (Kanban) ────────────────────────────
     {
         name: "civify_track_application",
+        title: "Track Job Application",
         description: "Record a job application in the candidate's Civify Kanban tracker board.",
         inputSchema: {
             type: "object",
@@ -540,9 +911,29 @@ const TOOLS = [
             },
             required: ["company_name", "job_title"],
         },
+        outputSchema: {
+            type: "object",
+            properties: {
+                id: { type: "string", description: "Unique identifier for the tracked application" },
+                companyName: { type: "string", description: "Company name" },
+                jobTitle: { type: "string", description: "Job title" },
+                status: { type: "string", description: "Kanban status (EVALUATED, APPLIED, INTERVIEW, OFFER, REJECTED)" },
+                notes: { type: "string", description: "Candidate notes and timeline details" },
+                createdAt: { type: "string", description: "Creation timestamp" },
+            },
+            required: ["id", "companyName", "jobTitle", "status"],
+        },
+        annotations: {
+            title: "Track Job Application",
+            readOnlyHint: false,
+            destructiveHint: false,
+            idempotentHint: false,
+            openWorldHint: false,
+        },
     },
     {
         name: "civify_list_applications",
+        title: "List Tracked Job Applications",
         description: "List all tracked job applications from the candidate's Civify Kanban board.",
         inputSchema: {
             type: "object",
@@ -550,12 +941,41 @@ const TOOLS = [
                 api_key: { type: "string", description: "Optional API key override." },
             },
         },
+        outputSchema: {
+            type: "object",
+            properties: {
+                applications: {
+                    type: "array",
+                    description: "List of tracked applications",
+                    items: {
+                        type: "object",
+                        properties: {
+                            id: { type: "string", description: "Application ID" },
+                            companyName: { type: "string", description: "Target company" },
+                            jobTitle: { type: "string", description: "Job title" },
+                            jobUrl: { type: "string", description: "Job posting link" },
+                            status: { type: "string", description: "Current status" },
+                            notes: { type: "string", description: "Application notes" },
+                        },
+                        required: ["id", "companyName", "jobTitle", "status"],
+                    },
+                },
+                total: { type: "number", description: "Total count of tracked applications" },
+            },
+        },
+        annotations: {
+            title: "List Tracked Job Applications",
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false,
+        },
     },
 ];
 export const createMcpServer = (sessionAuth) => {
     const server = new Server({
         name: "civify-mcp-server",
-        version: "1.2.0",
+        version: "1.2.1",
     }, {
         capabilities: {
             tools: {},
@@ -1116,7 +1536,7 @@ async function runSse(listenPort) {
         $schema: "https://modelcontextprotocol.io/schema/server-card.json",
         serverInfo: {
             name: "Civify MCP Server",
-            version: "1.2.0",
+            version: "1.2.1",
             description: "Official MCP server for Civify AI Career Platform (Resume Parsing, ATS Scoring, Tailoring, PII Masking, Kanban Applications, and Pay-Per-CV).",
         },
         authentication: {
@@ -1144,7 +1564,7 @@ async function runSse(listenPort) {
         res.json({
             status: "UP",
             service: "civify-mcp-server",
-            version: "1.2.0",
+            version: "1.2.1",
             transport: "sse",
             activeSessions: sseTransports.size,
             timestamp: new Date().toISOString(),
@@ -1177,7 +1597,7 @@ async function runSse(listenPort) {
         }
         res.json({
             service: "Civify Model Context Protocol (MCP) Server",
-            version: "1.2.0",
+            version: "1.2.1",
             homepage: "https://civify.cv",
             docs: "https://civify.cv/mcp-docs",
             endpoints: {
