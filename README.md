@@ -12,13 +12,28 @@ Enables autonomous AI agents (Claude Desktop, Cursor, OpenCode, Qwen CLI, LibreC
 
 ## ⚡ Quick Start & Connection Options
 
-### Option A: Hosted Remote SSE (Recommended — Zero Install)
-Connect directly to Civify's managed cloud MCP server over Server-Sent Events (SSE):
+### Option A: Hosted Remote — Streamable HTTP (Recommended — Zero Install)
+Connect directly to Civify's managed cloud MCP server using the new Streamable HTTP transport:
 
-- **SSE URL:** `https://mcp.civify.cv/sse`
+- **Streamable HTTP URL:** `https://mcp.civify.cv/mcp`
+- **Legacy SSE URL:** `https://mcp.civify.cv/sse`
 - **Healthcheck:** `https://mcp.civify.cv/health`
 
-#### Claude Desktop / Remote SSE Client
+#### Claude Desktop (Custom Connector)
+Add a custom connector with URL `https://mcp.civify.cv/mcp` — no config needed, authentication happens interactively in chat.
+
+#### Claude Desktop / MCP Client Config
+```json
+{
+  "mcpServers": {
+    "civify": {
+      "url": "https://mcp.civify.cv/mcp"
+    }
+  }
+}
+```
+
+#### Legacy SSE (Smithery, older clients)
 ```json
 {
   "mcpServers": {

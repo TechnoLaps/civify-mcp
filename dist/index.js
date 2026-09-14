@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 /**
  * Civify Model Context Protocol (MCP) Server
- * Supports dual transport:
+ * Supports triple transport:
  * 1. Stdio (Local desktop/CLI agents: Claude Desktop, Cursor, OpenCode)
- * 2. Remote SSE (Cloud deployments: Dokploy / Docker behind Traefik at mcp.civify.cv)
+ * 2. Remote SSE (Legacy cloud deployments and Smithery registry)
+ * 3. Streamable HTTP (New MCP standard — Claude Desktop connectors, modern agents)
  *
  * Dynamic Multi-User Authentication:
  * No static/global API key required.
@@ -17,7 +18,9 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
-import { CallToolRequestSchema, ListToolsRequestSchema, } from "@modelcontextprotocol/sdk/types.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { CallToolRequestSchema, ListToolsRequestSchema, isInitializeRequest, } from "@modelcontextprotocol/sdk/types.js";
+import { randomUUID } from "node:crypto";
 import axios from "axios";
 import * as fs from "fs";
 import * as path from "path";
@@ -43,7 +46,7 @@ const CIVIFY_BASE_URL = process.env.CIVIFY_API_URL || "https://civify.cv/apis";
 const CIVIFY_FRONTEND_URL = process.env.CIVIFY_FRONTEND_URL || "https://civify.cv";
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : null;
 const IS_SSE = process.argv.includes("--sse") || process.env.TRANSPORT === "sse" || PORT !== null;
-const SERVER_VERSION = "1.2.1";
+const SERVER_VERSION = "1.3.0";
 const getApiClient = (sessionAuth, overrideKey) => {
     const effectiveKey = overrideKey || sessionAuth.apiKey;
     const headers = {
@@ -1548,12 +1551,16 @@ async function runStdio() {
     await server.connect(transport);
     console.error("Civify MCP Server running on stdio transport (dynamic auth enabled).");
 }
-// ─── Remote SSE Mode (Dokploy / Docker behind Traefik) ────────────
+// ─── Remote Server Mode (SSE + Streamable HTTP) ────────────────────
 async function runSse(listenPort) {
     const app = express();
     app.use(cors({ origin: "*" }));
     app.use(express.json());
+    // Legacy SSE transport sessions
     const sseTransports = new Map();
+    // Streamable HTTP transport sessions (new MCP standard)
+    const streamableTransports = new Map();
+    const streamableSessionAuths = new Map();
     // Static Server Card for Smithery & MCP Registries (SEP-1649)
     const getServerCard = () => ({
         $schema: "https://modelcontextprotocol.io/schema/server-card.json",
@@ -1588,8 +1595,11 @@ async function runSse(listenPort) {
             status: "UP",
             service: "civify-mcp-server",
             version: SERVER_VERSION,
-            transport: "sse",
-            activeSessions: sseTransports.size,
+            transports: ["sse", "streamable-http"],
+            activeSessions: {
+                sse: sseTransports.size,
+                streamableHttp: streamableTransports.size,
+            },
             timestamp: new Date().toISOString(),
         });
     });
@@ -1624,6 +1634,7 @@ async function runSse(listenPort) {
             homepage: "https://civify.cv",
             docs: "https://civify.cv/mcp-docs",
             endpoints: {
+                streamableHttp: "/mcp",
                 sse: "/sse",
                 messages: "/messages",
                 health: "/health",
@@ -1633,6 +1644,7 @@ async function runSse(listenPort) {
             auth: "Dynamic per-session authentication supported (register, login, 2FA, or API key).",
         });
     });
+    // ─── Legacy SSE POST handler (/messages, /sse, /) ──────────────
     app.post(["/messages", "/sse", "/"], async (req, res) => {
         const sessionId = String(req.query.sessionId || req.body?.sessionId || "");
         const transport = sseTransports.get(sessionId);
@@ -1647,11 +1659,103 @@ async function runSse(listenPort) {
         }
         await transport.handlePostMessage(req, res);
     });
+    // ─── Streamable HTTP Transport (/mcp) ─────────────────────────────
+    // New MCP standard — used by Claude Desktop connectors, modern agents.
+    // Each initialize request creates a new per-session Server + Transport.
+    app.post("/mcp", async (req, res) => {
+        try {
+            const sessionId = req.headers["mcp-session-id"];
+            let transport;
+            if (sessionId && streamableTransports.has(sessionId)) {
+                // ── Reuse existing session ──
+                transport = streamableTransports.get(sessionId);
+            }
+            else if (!sessionId && isInitializeRequest(req.body)) {
+                // ── New initialize request — create session ──
+                const initialKey = req.headers["x-api-key"] ||
+                    req.headers["authorization"]?.replace(/^Bearer\s+/i, "") ||
+                    undefined;
+                const sessionAuth = { apiKey: initialKey };
+                transport = new StreamableHTTPServerTransport({
+                    sessionIdGenerator: () => randomUUID(),
+                    onsessioninitialized: (newSessionId) => {
+                        streamableTransports.set(newSessionId, transport);
+                        streamableSessionAuths.set(newSessionId, sessionAuth);
+                        console.log(`[Streamable HTTP] Session initialized: ${newSessionId} (key: ${initialKey ? "provided" : "none"})`);
+                    },
+                });
+                transport.onclose = () => {
+                    const sid = transport.sessionId;
+                    if (sid) {
+                        streamableTransports.delete(sid);
+                        streamableSessionAuths.delete(sid);
+                        console.log(`[Streamable HTTP] Session closed: ${sid}`);
+                    }
+                };
+                // Create per-session MCP server with auth state
+                const server = createMcpServer(sessionAuth);
+                await server.connect(transport);
+                // Handle the initialize request
+                await transport.handleRequest(req, res, req.body);
+                return;
+            }
+            else {
+                // No session ID and not an initialize request
+                res.status(400).json({
+                    jsonrpc: "2.0",
+                    error: {
+                        code: -32000,
+                        message: "Bad Request: No valid session ID provided. Send an initialize request first.",
+                    },
+                    id: null,
+                });
+                return;
+            }
+            // Handle subsequent requests on existing transport
+            await transport.handleRequest(req, res, req.body);
+        }
+        catch (error) {
+            console.error("[Streamable HTTP] Error handling request:", error);
+            if (!res.headersSent) {
+                res.status(500).json({
+                    jsonrpc: "2.0",
+                    error: { code: -32603, message: "Internal server error" },
+                    id: null,
+                });
+            }
+        }
+    });
+    // Streamable HTTP GET — used for SSE stream reconnection (server-initiated notifications)
+    app.get("/mcp", async (req, res) => {
+        const sessionId = req.headers["mcp-session-id"];
+        if (sessionId && streamableTransports.has(sessionId)) {
+            const transport = streamableTransports.get(sessionId);
+            await transport.handleRequest(req, res);
+        }
+        else {
+            res.status(405).set("Allow", "POST, DELETE").send("Method Not Allowed");
+        }
+    });
+    // Streamable HTTP DELETE — session termination
+    app.delete("/mcp", async (req, res) => {
+        const sessionId = req.headers["mcp-session-id"];
+        if (sessionId && streamableTransports.has(sessionId)) {
+            const transport = streamableTransports.get(sessionId);
+            await transport.handleRequest(req, res);
+            streamableTransports.delete(sessionId);
+            streamableSessionAuths.delete(sessionId);
+            console.log(`[Streamable HTTP] Session terminated by client: ${sessionId}`);
+        }
+        else {
+            res.status(404).json({ error: "Session not found" });
+        }
+    });
     app.listen(listenPort, "0.0.0.0", () => {
-        console.log(`🚀 Civify Remote MCP Server running on port ${listenPort}`);
-        console.log(`🔗 SSE endpoint: http://0.0.0.0:${listenPort}/sse`);
-        console.log(`🩺 Healthcheck: http://0.0.0.0:${listenPort}/health`);
-        console.log(`📋 Server Card: http://0.0.0.0:${listenPort}/.well-known/mcp/server-card.json`);
+        console.log(`🚀 Civify MCP Server running on port ${listenPort}`);
+        console.log(`🔗 SSE endpoint:            http://0.0.0.0:${listenPort}/sse`);
+        console.log(`🔗 Streamable HTTP endpoint: http://0.0.0.0:${listenPort}/mcp`);
+        console.log(`🩺 Healthcheck:              http://0.0.0.0:${listenPort}/health`);
+        console.log(`📋 Server Card:              http://0.0.0.0:${listenPort}/.well-known/mcp/server-card.json`);
     });
 }
 const isMainModule = () => {

@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 /**
  * Civify Model Context Protocol (MCP) Server
- * Supports dual transport:
+ * Supports triple transport:
  * 1. Stdio (Local desktop/CLI agents: Claude Desktop, Cursor, OpenCode)
- * 2. Remote SSE (Cloud deployments: Dokploy / Docker behind Traefik at mcp.civify.cv)
+ * 2. Remote SSE (Legacy cloud deployments and Smithery registry)
+ * 3. Streamable HTTP (New MCP standard — Claude Desktop connectors, modern agents)
  *
  * Dynamic Multi-User Authentication:
  * No static/global API key required.
