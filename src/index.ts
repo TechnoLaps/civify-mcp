@@ -58,19 +58,32 @@ if (process.env.DNS_SERVERS) {
   }
 }
 
-// Custom lookup: try Node.js dns.resolve4 first (uses setServers), fall back to OS
+// Custom lookup: try Node.js dns.resolve4 first (uses setServers), fall back to OS getaddrinfo
 const customLookup = (
   hostname: string,
-  options: any,
-  callback: (err: NodeJS.ErrnoException | null, address: string, family: number) => void
+  optionsOrCallback: any,
+  maybeCallback?: any
 ) => {
+  // Handle both (hostname, callback) and (hostname, options, callback) signatures
+  const callback = typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback;
+  if (typeof callback !== "function") return;
+
   dns.resolve4(hostname, (err, addresses) => {
     if (!err && addresses && addresses.length > 0) {
+      console.log(`[DNS] Resolved ${hostname} → ${addresses[0]} via dns.resolve4`);
       callback(null, addresses[0], 4);
     } else {
-      // Fallback to OS resolver
-      osLookup(hostname, { family: 4 }, (err2, address) => {
-        callback(err2, address, 4);
+      // Fallback to OS resolver (getaddrinfo)
+      osLookup(hostname, { family: 4 }, (err2: any, address: string, family: number) => {
+        if (!err2 && address) {
+          console.log(`[DNS] Resolved ${hostname} → ${address} via OS fallback`);
+          callback(null, address, family || 4);
+        } else {
+          // Both failed — propagate error clearly
+          const finalErr = err2 || err || Object.assign(new Error(`DNS resolution failed for ${hostname}`), { code: "EAI_AGAIN" });
+          console.error(`[DNS] BOTH resolvers failed for ${hostname}:`, finalErr.message);
+          callback(finalErr, "", 4);
+        }
       });
     }
   });
@@ -83,6 +96,16 @@ const httpsAgent = new https.Agent({ lookup: customLookup as any });
 // Set as Axios defaults so bare axios.post/get (auth endpoints) also use custom DNS
 axios.defaults.httpAgent = httpAgent;
 axios.defaults.httpsAgent = httpsAgent;
+
+// Startup DNS diagnostic — verify resolution before serving
+dns.resolve4("civify.cv", (err, addresses) => {
+  if (err) {
+    console.error(`[DNS] ⚠️  Startup probe FAILED for civify.cv: ${err.message} (code: ${err.code})`);
+    console.error(`[DNS] Configured servers: ${dns.getServers().join(", ")}`);
+  } else {
+    console.log(`[DNS] ✅ Startup probe OK: civify.cv → ${addresses.join(", ")} (servers: ${dns.getServers().join(", ")})`);
+  }
+});
 
 const CIVIFY_BASE_URL = process.env.CIVIFY_API_URL || "https://civify.cv/apis";
 const CIVIFY_FRONTEND_URL = process.env.CIVIFY_FRONTEND_URL || "https://civify.cv";
