@@ -36,82 +36,240 @@ import FormData from "form-data";
 import express from "express";
 import cors from "cors";
 import dns from "node:dns";
-import { lookup as osLookup } from "node:dns";
-import http from "node:http";
-import https from "node:https";
 
-// ─── DNS Hardening for Docker/Alpine ──────────────────────────────
-// Alpine's musl libc has unreliable DNS (EAI_AGAIN on civify.cv).
-// 1. Prefer IPv4 to avoid AAAA timeouts
-// 2. Set explicit DNS servers via env
-// 3. Force Axios to use Node.js resolver (dns.resolve4) which respects setServers(),
-//    instead of OS getaddrinfo which doesn't.
+// ─── DNS Resilience (Adopted from Civify SSR Dispatcher) ────────────
+// Dokploy/Alpine containers have unreliable internal DNS causing EAI_AGAIN.
+// 1. Map civify.cv & stg.civify.cv directly to server IP (34.44.205.35) — 0ms DNS latency.
+// 2. Monkey-patch dns.lookup & dns.promises.lookup to handle options.all properly.
+// 3. Fallback to Cloudflare & Google public DNS for any external host.
 try {
   dns.setDefaultResultOrder("ipv4first");
 } catch (_) {}
 
-if (process.env.DNS_SERVERS) {
+const DEFAULT_HOST_MAP: Record<string, string> = {
+  "civify.cv": process.env.CIVIFY_TARGET_IP || "34.44.205.35",
+  "stg.civify.cv": process.env.CIVIFY_TARGET_IP || "34.44.205.35",
+};
+
+const DEFAULT_FALLBACK_DNS = ["1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4"];
+
+function buildHostMap(): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const [host, ip] of Object.entries(DEFAULT_HOST_MAP)) {
+    map.set(host.toLowerCase(), ip);
+  }
+  const envMap = process.env.BLOG_SSR_HOST_MAP || process.env.CIVIFY_HOST_MAP;
+  if (envMap) {
+    for (const pair of envMap.split(",")) {
+      const [host, ip] = pair.split("=").map((s) => s.trim());
+      if (host && ip) map.set(host.toLowerCase(), ip);
+    }
+  }
+  const singleHost = (process.env.BLOG_SSR_HOST_HEADER || process.env.CIVIFY_HOST_HEADER)?.trim();
+  const singleIp = (process.env.BLOG_SSR_TARGET_IP || process.env.CIVIFY_TARGET_IP)?.trim();
+  if (singleHost && singleIp) {
+    map.set(singleHost.toLowerCase(), singleIp);
+  }
+  return map;
+}
+
+function getFallbackResolver(): dns.promises.Resolver {
+  const servers =
+    (process.env.BLOG_SSR_FALLBACK_DNS || process.env.DNS_SERVERS)?.split(",")
+      .map((s) => s.trim())
+      .filter(Boolean) || DEFAULT_FALLBACK_DNS;
+  const resolver = new dns.promises.Resolver({ timeout: 3000, tries: 2 });
   try {
-    dns.setServers(process.env.DNS_SERVERS.split(",").map((s) => s.trim()));
-  } catch (e) {
-    console.error("[DNS] Failed to set custom DNS servers:", e);
+    resolver.setServers(servers);
+  } catch {
+    resolver.setServers(DEFAULT_FALLBACK_DNS);
+  }
+  return resolver;
+}
+
+const negativeDnsCache = new Map<string, number>();
+const NEGATIVE_TTL_MS = 30_000;
+const positiveDnsCache = new Map<string, { ip: string; family: number; expires: number }>();
+const POSITIVE_TTL_MS = 60_000;
+
+async function resolveViaFallback(
+  hostname: string
+): Promise<{ address: string; family: number } | null> {
+  const cached = positiveDnsCache.get(hostname);
+  if (cached && cached.expires > Date.now()) {
+    return { address: cached.ip, family: cached.family };
+  }
+  const negativeAt = negativeDnsCache.get(hostname);
+  if (negativeAt && Date.now() - negativeAt < NEGATIVE_TTL_MS) {
+    return null;
+  }
+
+  try {
+    const resolver = getFallbackResolver();
+    const v4 = await resolver.resolve4(hostname).catch(() => [] as string[]);
+    if (v4.length > 0) {
+      const ip = v4[0];
+      positiveDnsCache.set(hostname, {
+        ip,
+        family: 4,
+        expires: Date.now() + POSITIVE_TTL_MS,
+      });
+      return { address: ip, family: 4 };
+    }
+    const v6 = await resolver.resolve6(hostname).catch(() => [] as string[]);
+    if (v6.length > 0) {
+      const ip = v6[0];
+      positiveDnsCache.set(hostname, {
+        ip,
+        family: 6,
+        expires: Date.now() + POSITIVE_TTL_MS,
+      });
+      return { address: ip, family: 6 };
+    }
+  } catch (_) {}
+  negativeDnsCache.set(hostname, Date.now());
+  return null;
+}
+
+function isTransientDnsError(err: unknown): boolean {
+  const code = (err as { code?: string } | null)?.code ?? "";
+  return (
+    code === "EAI_AGAIN" ||
+    code === "ENOTFOUND" ||
+    code === "ETIMEDOUT" ||
+    code === "ESERVFAIL"
+  );
+}
+
+function installDnsDispatcher(): void {
+  const map = buildHostMap();
+  const originalLookup = dns.lookup;
+  const originalLookupPromise = dns.promises.lookup;
+
+  const resolveOverride = (hostname: unknown): string | undefined => {
+    if (typeof hostname !== "string") return undefined;
+    return map.get(hostname.toLowerCase());
+  };
+
+  const patchedLookup = function patchedLookup(
+    this: unknown,
+    ...args: unknown[]
+  ): unknown {
+    const hostname = args[0];
+    let options: Record<string, unknown> = {};
+    let callback: ((...cbArgs: unknown[]) => void) | undefined;
+
+    if (typeof args[1] === "function") {
+      callback = args[1] as (...cbArgs: unknown[]) => void;
+    } else if (typeof args[2] === "function") {
+      callback = args[2] as (...cbArgs: unknown[]) => void;
+      if (typeof args[1] === "number") {
+        options = { family: args[1] };
+      } else if (typeof args[1] === "object" && args[1] !== null) {
+        options = args[1] as Record<string, unknown>;
+      }
+    }
+
+    if (!callback) {
+      return (originalLookup as (...a: unknown[]) => unknown).apply(dns, args);
+    }
+
+    const ip = resolveOverride(hostname);
+    if (ip) {
+      if (options.all) {
+        callback(null, [{ address: ip, family: 4 }]);
+      } else {
+        callback(null, ip, 4);
+      }
+      return;
+    }
+
+    (originalLookup as (...a: unknown[]) => unknown).call(
+      dns,
+      hostname,
+      options,
+      (err: unknown, addr: unknown, family: unknown) => {
+        if (!err) {
+          callback(err, addr, family);
+          return;
+        }
+        if (!isTransientDnsError(err) || typeof hostname !== "string") {
+          callback(err);
+          return;
+        }
+        resolveViaFallback(hostname).then((result) => {
+          if (!result) {
+            callback(err);
+            return;
+          }
+          if (options.all) {
+            callback(null, [{ address: result.address, family: result.family }]);
+          } else {
+            callback(null, result.address, result.family);
+          }
+        });
+      }
+    );
+  };
+
+  const patchedLookupPromise = async function patchedLookupPromise(
+    hostname: string,
+    options?: unknown
+  ): Promise<unknown> {
+    const all =
+      typeof options === "object" &&
+      options !== null &&
+      (options as { all?: boolean }).all === true;
+
+    const ip = resolveOverride(hostname);
+    if (ip) {
+      if (all) return [{ address: ip, family: 4 }];
+      return { address: ip, family: 4 };
+    }
+
+    try {
+      return await (
+        originalLookupPromise as unknown as (h: string, o?: unknown) => Promise<unknown>
+      ).call(dns.promises, hostname, options);
+    } catch (error) {
+      if (!isTransientDnsError(error)) throw error;
+      const fallback = await resolveViaFallback(hostname);
+      if (!fallback) throw error;
+      if (all) {
+        return [{ address: fallback.address, family: fallback.family }];
+      }
+      return { address: fallback.address, family: fallback.family };
+    }
+  };
+
+  try {
+    Object.defineProperty(dns, "lookup", {
+      configurable: true,
+      writable: true,
+      value: patchedLookup,
+    });
+    Object.defineProperty(dns.promises, "lookup", {
+      configurable: true,
+      writable: true,
+      value: patchedLookupPromise,
+    });
+    console.log(
+      `[DNS Dispatcher] ✅ Installed. Overrides: ${Array.from(map.entries())
+        .map(([h, i]) => `${h}=>${i}`)
+        .join(", ")} | Fallback DNS: ${DEFAULT_FALLBACK_DNS.join(", ")}`
+    );
+  } catch (error) {
+    console.warn("[DNS Dispatcher] ⚠️ Failed to patch dns.lookup:", error);
   }
 }
 
-// Custom lookup: try Node.js dns.resolve4 first (uses setServers), fall back to OS getaddrinfo
-const customLookup = (
-  hostname: string,
-  optionsOrCallback: any,
-  maybeCallback?: any
-) => {
-  // Handle both (hostname, callback) and (hostname, options, callback) signatures
-  const callback = typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback;
-  if (typeof callback !== "function") return;
-
-  dns.resolve4(hostname, (err, addresses) => {
-    if (!err && addresses && addresses.length > 0) {
-      console.log(`[DNS] Resolved ${hostname} → ${addresses[0]} via dns.resolve4`);
-      callback(null, addresses[0], 4);
-    } else {
-      // Fallback to OS resolver (getaddrinfo)
-      osLookup(hostname, { family: 4 }, (err2: any, address: string, family: number) => {
-        if (!err2 && address) {
-          console.log(`[DNS] Resolved ${hostname} → ${address} via OS fallback`);
-          callback(null, address, family || 4);
-        } else {
-          // Both failed — propagate error clearly
-          const finalErr = err2 || err || Object.assign(new Error(`DNS resolution failed for ${hostname}`), { code: "EAI_AGAIN" });
-          console.error(`[DNS] BOTH resolvers failed for ${hostname}:`, finalErr.message);
-          callback(finalErr, "", 4);
-        }
-      });
-    }
-  });
-};
-
-// Apply custom DNS lookup to all HTTP/HTTPS requests (Axios uses these agents)
-const httpAgent = new http.Agent({ lookup: customLookup as any });
-const httpsAgent = new https.Agent({ lookup: customLookup as any });
-
-// Set as Axios defaults so bare axios.post/get (auth endpoints) also use custom DNS
-axios.defaults.httpAgent = httpAgent;
-axios.defaults.httpsAgent = httpsAgent;
-
-// Startup DNS diagnostic — verify resolution before serving
-dns.resolve4("civify.cv", (err, addresses) => {
-  if (err) {
-    console.error(`[DNS] ⚠️  Startup probe FAILED for civify.cv: ${err.message} (code: ${err.code})`);
-    console.error(`[DNS] Configured servers: ${dns.getServers().join(", ")}`);
-  } else {
-    console.log(`[DNS] ✅ Startup probe OK: civify.cv → ${addresses.join(", ")} (servers: ${dns.getServers().join(", ")})`);
-  }
-});
+installDnsDispatcher();
 
 const CIVIFY_BASE_URL = process.env.CIVIFY_API_URL || "https://civify.cv/apis";
 const CIVIFY_FRONTEND_URL = process.env.CIVIFY_FRONTEND_URL || "https://civify.cv";
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : null;
 const IS_SSE = process.argv.includes("--sse") || process.env.TRANSPORT === "sse" || PORT !== null;
-const SERVER_VERSION = "1.3.0";
+const SERVER_VERSION = "1.3.1";
 
 /**
  * Session Authentication State
@@ -141,8 +299,6 @@ const getApiClient = (sessionAuth: SessionAuthState, overrideKey?: string): Axio
     baseURL: CIVIFY_BASE_URL,
     timeout: 90000,
     headers,
-    httpAgent,
-    httpsAgent,
   });
 };
 
@@ -1121,11 +1277,24 @@ export const createMcpServer = (sessionAuth: SessionAuthState) => {
   });
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const startTime = Date.now();
     const { name, arguments: args } = request.params;
     const argApiKey = args?.api_key ? String(args.api_key).trim() : undefined;
 
+    // Mask sensitive fields for audit traffic logs
+    const sanitizedArgs: Record<string, any> = { ...(args || {}) };
+    if (sanitizedArgs.password) sanitizedArgs.password = "***";
+    if (sanitizedArgs.code) sanitizedArgs.code = "***";
+    if (sanitizedArgs.api_key) {
+      const k = String(sanitizedArgs.api_key);
+      sanitizedArgs.api_key = k.length > 8 ? k.substring(0, 8) + "..." : "***";
+    }
+
+    console.log(`[MCP Tool Request] 🛠️  ${name} | Args: ${JSON.stringify(sanitizedArgs)}`);
+
     try {
-      switch (name) {
+      const executeTool = async () => {
+        switch (name) {
         // ─── Set API Key ─────────────────────────────────────────
         case "civify_set_api_key": {
           const rawKey = String(args?.api_key || "").trim();
@@ -1759,13 +1928,21 @@ export const createMcpServer = (sessionAuth: SessionAuthState) => {
 
         default:
           throw new Error(`Unknown tool: ${name}`);
-      }
+        }
+      };
+
+      const result = await executeTool();
+      const duration = Date.now() - startTime;
+      console.log(`[MCP Tool Response] ✅ ${name} completed (${duration}ms)`);
+      return result;
     } catch (error: any) {
+      const duration = Date.now() - startTime;
       const errorMsg = error?.response?.data
         ? typeof error.response.data === "string"
           ? error.response.data
           : JSON.stringify(error.response.data)
         : error.message;
+      console.error(`[MCP Tool Error] ❌ ${name} failed (${duration}ms): ${errorMsg}`);
       return {
         content: [{ type: "text", text: `Civify MCP Error: ${errorMsg}` }],
         isError: true,
@@ -1792,6 +1969,31 @@ async function runSse(listenPort: number) {
   const app = express();
   app.use(cors({ origin: "*" }));
   app.use(express.json());
+
+  // ─── Traffic Logging Middleware (Observability for Docker/Dokploy) ──
+  app.use((req, res, next) => {
+    // Skip health probe to avoid polluting logs
+    if (req.path === "/health") return next();
+
+    const start = Date.now();
+    const sessionId =
+      (req.headers["mcp-session-id"] as string) ||
+      (req.query.sessionId as string) ||
+      "-";
+    const rpcInfo = req.body?.method
+      ? `[rpc: ${req.body.method}${req.body?.params?.name ? ` -> ${req.body.params.name}` : ""}]`
+      : "";
+
+    console.log(`[MCP HTTP In] ${req.method} ${req.originalUrl || req.url} ${rpcInfo} (session: ${sessionId})`);
+
+    res.on("finish", () => {
+      const duration = Date.now() - start;
+      console.log(
+        `[MCP HTTP Out] ${req.method} ${req.originalUrl || req.url} ${rpcInfo} → HTTP ${res.statusCode} (${duration}ms)`
+      );
+    });
+    next();
+  });
 
   // Legacy SSE transport sessions
   const sseTransports: Map<string, SSEServerTransport> = new Map();

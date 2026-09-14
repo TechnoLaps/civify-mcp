@@ -29,76 +29,211 @@ import FormData from "form-data";
 import express from "express";
 import cors from "cors";
 import dns from "node:dns";
-import { lookup as osLookup } from "node:dns";
-import http from "node:http";
-import https from "node:https";
-// ─── DNS Hardening for Docker/Alpine ──────────────────────────────
-// Alpine's musl libc has unreliable DNS (EAI_AGAIN on civify.cv).
-// 1. Prefer IPv4 to avoid AAAA timeouts
-// 2. Set explicit DNS servers via env
-// 3. Force Axios to use Node.js resolver (dns.resolve4) which respects setServers(),
-//    instead of OS getaddrinfo which doesn't.
+// ─── DNS Resilience (Adopted from Civify SSR Dispatcher) ────────────
+// Dokploy/Alpine containers have unreliable internal DNS causing EAI_AGAIN.
+// 1. Map civify.cv & stg.civify.cv directly to server IP (34.44.205.35) — 0ms DNS latency.
+// 2. Monkey-patch dns.lookup & dns.promises.lookup to handle options.all properly.
+// 3. Fallback to Cloudflare & Google public DNS for any external host.
 try {
     dns.setDefaultResultOrder("ipv4first");
 }
 catch (_) { }
-if (process.env.DNS_SERVERS) {
-    try {
-        dns.setServers(process.env.DNS_SERVERS.split(",").map((s) => s.trim()));
+const DEFAULT_HOST_MAP = {
+    "civify.cv": process.env.CIVIFY_TARGET_IP || "34.44.205.35",
+    "stg.civify.cv": process.env.CIVIFY_TARGET_IP || "34.44.205.35",
+};
+const DEFAULT_FALLBACK_DNS = ["1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4"];
+function buildHostMap() {
+    const map = new Map();
+    for (const [host, ip] of Object.entries(DEFAULT_HOST_MAP)) {
+        map.set(host.toLowerCase(), ip);
     }
-    catch (e) {
-        console.error("[DNS] Failed to set custom DNS servers:", e);
-    }
-}
-// Custom lookup: try Node.js dns.resolve4 first (uses setServers), fall back to OS getaddrinfo
-const customLookup = (hostname, optionsOrCallback, maybeCallback) => {
-    // Handle both (hostname, callback) and (hostname, options, callback) signatures
-    const callback = typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback;
-    if (typeof callback !== "function")
-        return;
-    dns.resolve4(hostname, (err, addresses) => {
-        if (!err && addresses && addresses.length > 0) {
-            console.log(`[DNS] Resolved ${hostname} → ${addresses[0]} via dns.resolve4`);
-            callback(null, addresses[0], 4);
+    const envMap = process.env.BLOG_SSR_HOST_MAP || process.env.CIVIFY_HOST_MAP;
+    if (envMap) {
+        for (const pair of envMap.split(",")) {
+            const [host, ip] = pair.split("=").map((s) => s.trim());
+            if (host && ip)
+                map.set(host.toLowerCase(), ip);
         }
-        else {
-            // Fallback to OS resolver (getaddrinfo)
-            osLookup(hostname, { family: 4 }, (err2, address, family) => {
-                if (!err2 && address) {
-                    console.log(`[DNS] Resolved ${hostname} → ${address} via OS fallback`);
-                    callback(null, address, family || 4);
+    }
+    const singleHost = (process.env.BLOG_SSR_HOST_HEADER || process.env.CIVIFY_HOST_HEADER)?.trim();
+    const singleIp = (process.env.BLOG_SSR_TARGET_IP || process.env.CIVIFY_TARGET_IP)?.trim();
+    if (singleHost && singleIp) {
+        map.set(singleHost.toLowerCase(), singleIp);
+    }
+    return map;
+}
+function getFallbackResolver() {
+    const servers = (process.env.BLOG_SSR_FALLBACK_DNS || process.env.DNS_SERVERS)?.split(",")
+        .map((s) => s.trim())
+        .filter(Boolean) || DEFAULT_FALLBACK_DNS;
+    const resolver = new dns.promises.Resolver({ timeout: 3000, tries: 2 });
+    try {
+        resolver.setServers(servers);
+    }
+    catch {
+        resolver.setServers(DEFAULT_FALLBACK_DNS);
+    }
+    return resolver;
+}
+const negativeDnsCache = new Map();
+const NEGATIVE_TTL_MS = 30_000;
+const positiveDnsCache = new Map();
+const POSITIVE_TTL_MS = 60_000;
+async function resolveViaFallback(hostname) {
+    const cached = positiveDnsCache.get(hostname);
+    if (cached && cached.expires > Date.now()) {
+        return { address: cached.ip, family: cached.family };
+    }
+    const negativeAt = negativeDnsCache.get(hostname);
+    if (negativeAt && Date.now() - negativeAt < NEGATIVE_TTL_MS) {
+        return null;
+    }
+    try {
+        const resolver = getFallbackResolver();
+        const v4 = await resolver.resolve4(hostname).catch(() => []);
+        if (v4.length > 0) {
+            const ip = v4[0];
+            positiveDnsCache.set(hostname, {
+                ip,
+                family: 4,
+                expires: Date.now() + POSITIVE_TTL_MS,
+            });
+            return { address: ip, family: 4 };
+        }
+        const v6 = await resolver.resolve6(hostname).catch(() => []);
+        if (v6.length > 0) {
+            const ip = v6[0];
+            positiveDnsCache.set(hostname, {
+                ip,
+                family: 6,
+                expires: Date.now() + POSITIVE_TTL_MS,
+            });
+            return { address: ip, family: 6 };
+        }
+    }
+    catch (_) { }
+    negativeDnsCache.set(hostname, Date.now());
+    return null;
+}
+function isTransientDnsError(err) {
+    const code = err?.code ?? "";
+    return (code === "EAI_AGAIN" ||
+        code === "ENOTFOUND" ||
+        code === "ETIMEDOUT" ||
+        code === "ESERVFAIL");
+}
+function installDnsDispatcher() {
+    const map = buildHostMap();
+    const originalLookup = dns.lookup;
+    const originalLookupPromise = dns.promises.lookup;
+    const resolveOverride = (hostname) => {
+        if (typeof hostname !== "string")
+            return undefined;
+        return map.get(hostname.toLowerCase());
+    };
+    const patchedLookup = function patchedLookup(...args) {
+        const hostname = args[0];
+        let options = {};
+        let callback;
+        if (typeof args[1] === "function") {
+            callback = args[1];
+        }
+        else if (typeof args[2] === "function") {
+            callback = args[2];
+            if (typeof args[1] === "number") {
+                options = { family: args[1] };
+            }
+            else if (typeof args[1] === "object" && args[1] !== null) {
+                options = args[1];
+            }
+        }
+        if (!callback) {
+            return originalLookup.apply(dns, args);
+        }
+        const ip = resolveOverride(hostname);
+        if (ip) {
+            if (options.all) {
+                callback(null, [{ address: ip, family: 4 }]);
+            }
+            else {
+                callback(null, ip, 4);
+            }
+            return;
+        }
+        originalLookup.call(dns, hostname, options, (err, addr, family) => {
+            if (!err) {
+                callback(err, addr, family);
+                return;
+            }
+            if (!isTransientDnsError(err) || typeof hostname !== "string") {
+                callback(err);
+                return;
+            }
+            resolveViaFallback(hostname).then((result) => {
+                if (!result) {
+                    callback(err);
+                    return;
+                }
+                if (options.all) {
+                    callback(null, [{ address: result.address, family: result.family }]);
                 }
                 else {
-                    // Both failed — propagate error clearly
-                    const finalErr = err2 || err || Object.assign(new Error(`DNS resolution failed for ${hostname}`), { code: "EAI_AGAIN" });
-                    console.error(`[DNS] BOTH resolvers failed for ${hostname}:`, finalErr.message);
-                    callback(finalErr, "", 4);
+                    callback(null, result.address, result.family);
                 }
             });
+        });
+    };
+    const patchedLookupPromise = async function patchedLookupPromise(hostname, options) {
+        const all = typeof options === "object" &&
+            options !== null &&
+            options.all === true;
+        const ip = resolveOverride(hostname);
+        if (ip) {
+            if (all)
+                return [{ address: ip, family: 4 }];
+            return { address: ip, family: 4 };
         }
-    });
-};
-// Apply custom DNS lookup to all HTTP/HTTPS requests (Axios uses these agents)
-const httpAgent = new http.Agent({ lookup: customLookup });
-const httpsAgent = new https.Agent({ lookup: customLookup });
-// Set as Axios defaults so bare axios.post/get (auth endpoints) also use custom DNS
-axios.defaults.httpAgent = httpAgent;
-axios.defaults.httpsAgent = httpsAgent;
-// Startup DNS diagnostic — verify resolution before serving
-dns.resolve4("civify.cv", (err, addresses) => {
-    if (err) {
-        console.error(`[DNS] ⚠️  Startup probe FAILED for civify.cv: ${err.message} (code: ${err.code})`);
-        console.error(`[DNS] Configured servers: ${dns.getServers().join(", ")}`);
+        try {
+            return await originalLookupPromise.call(dns.promises, hostname, options);
+        }
+        catch (error) {
+            if (!isTransientDnsError(error))
+                throw error;
+            const fallback = await resolveViaFallback(hostname);
+            if (!fallback)
+                throw error;
+            if (all) {
+                return [{ address: fallback.address, family: fallback.family }];
+            }
+            return { address: fallback.address, family: fallback.family };
+        }
+    };
+    try {
+        Object.defineProperty(dns, "lookup", {
+            configurable: true,
+            writable: true,
+            value: patchedLookup,
+        });
+        Object.defineProperty(dns.promises, "lookup", {
+            configurable: true,
+            writable: true,
+            value: patchedLookupPromise,
+        });
+        console.log(`[DNS Dispatcher] ✅ Installed. Overrides: ${Array.from(map.entries())
+            .map(([h, i]) => `${h}=>${i}`)
+            .join(", ")} | Fallback DNS: ${DEFAULT_FALLBACK_DNS.join(", ")}`);
     }
-    else {
-        console.log(`[DNS] ✅ Startup probe OK: civify.cv → ${addresses.join(", ")} (servers: ${dns.getServers().join(", ")})`);
+    catch (error) {
+        console.warn("[DNS Dispatcher] ⚠️ Failed to patch dns.lookup:", error);
     }
-});
+}
+installDnsDispatcher();
 const CIVIFY_BASE_URL = process.env.CIVIFY_API_URL || "https://civify.cv/apis";
 const CIVIFY_FRONTEND_URL = process.env.CIVIFY_FRONTEND_URL || "https://civify.cv";
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : null;
 const IS_SSE = process.argv.includes("--sse") || process.env.TRANSPORT === "sse" || PORT !== null;
-const SERVER_VERSION = "1.3.0";
+const SERVER_VERSION = "1.3.1";
 const getApiClient = (sessionAuth, overrideKey) => {
     const effectiveKey = overrideKey || sessionAuth.apiKey;
     const headers = {
@@ -115,8 +250,6 @@ const getApiClient = (sessionAuth, overrideKey) => {
         baseURL: CIVIFY_BASE_URL,
         timeout: 90000,
         headers,
-        httpAgent,
-        httpsAgent,
     });
 };
 const ensureAuthenticated = (sessionAuth, overrideKey) => {
@@ -1065,531 +1198,551 @@ export const createMcpServer = (sessionAuth) => {
         return { tools: TOOLS };
     });
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
+        const startTime = Date.now();
         const { name, arguments: args } = request.params;
         const argApiKey = args?.api_key ? String(args.api_key).trim() : undefined;
+        // Mask sensitive fields for audit traffic logs
+        const sanitizedArgs = { ...(args || {}) };
+        if (sanitizedArgs.password)
+            sanitizedArgs.password = "***";
+        if (sanitizedArgs.code)
+            sanitizedArgs.code = "***";
+        if (sanitizedArgs.api_key) {
+            const k = String(sanitizedArgs.api_key);
+            sanitizedArgs.api_key = k.length > 8 ? k.substring(0, 8) + "..." : "***";
+        }
+        console.log(`[MCP Tool Request] 🛠️  ${name} | Args: ${JSON.stringify(sanitizedArgs)}`);
         try {
-            switch (name) {
-                // ─── Set API Key ─────────────────────────────────────────
-                case "civify_set_api_key": {
-                    const rawKey = String(args?.api_key || "").trim();
-                    if (!rawKey) {
-                        throw new Error("api_key parameter is required.");
-                    }
-                    const profileRes = await axios.get(`${CIVIFY_BASE_URL}/v1/external/cvs/user/profile`, {
-                        headers: { "X-API-KEY": rawKey, Accept: "application/json" },
-                    });
-                    sessionAuth.apiKey = rawKey;
-                    sessionAuth.userProfile = profileRes.data;
-                    return {
-                        content: [
-                            {
-                                type: "text",
-                                text: JSON.stringify({
-                                    status: "AUTHENTICATED",
-                                    message: "Civify API key validated and activated for this session.",
-                                    user: sessionAuth.userProfile,
-                                }, null, 2),
-                            },
-                        ],
-                    };
-                }
-                // ─── Login (Email/Password + Auto-Provision Key) ──────────
-                case "civify_login": {
-                    const identifier = String(args?.identifier || "").trim();
-                    const password = String(args?.password || "").trim();
-                    if (!identifier || !password) {
-                        throw new Error("Both identifier (email or username) and password are required.");
-                    }
-                    const isEmail = identifier.includes("@");
-                    const payload = isEmail ? { email: identifier, password } : { username: identifier, password };
-                    const loginRes = await axios.post(`${CIVIFY_BASE_URL}/auth/login`, payload, {
-                        headers: { "Content-Type": "application/json", Accept: "application/json" },
-                    });
-                    const loginData = loginRes.data;
-                    if (loginData.requires2FA) {
-                        sessionAuth.pending2faUsername = identifier;
+            const executeTool = async () => {
+                switch (name) {
+                    // ─── Set API Key ─────────────────────────────────────────
+                    case "civify_set_api_key": {
+                        const rawKey = String(args?.api_key || "").trim();
+                        if (!rawKey) {
+                            throw new Error("api_key parameter is required.");
+                        }
+                        const profileRes = await axios.get(`${CIVIFY_BASE_URL}/v1/external/cvs/user/profile`, {
+                            headers: { "X-API-KEY": rawKey, Accept: "application/json" },
+                        });
+                        sessionAuth.apiKey = rawKey;
+                        sessionAuth.userProfile = profileRes.data;
                         return {
                             content: [
                                 {
                                     type: "text",
                                     text: JSON.stringify({
-                                        status: "2FA_REQUIRED",
-                                        message: loginData.message || "2FA OTP sent to your email.",
-                                        username: identifier,
-                                        action_required: "Call 'civify_verify_2fa' with the OTP code sent to your email.",
+                                        status: "AUTHENTICATED",
+                                        message: "Civify API key validated and activated for this session.",
+                                        user: sessionAuth.userProfile,
                                     }, null, 2),
                                 },
                             ],
                         };
                     }
-                    const accessToken = loginData.accessToken;
-                    if (!accessToken) {
-                        throw new Error(`Login failed: ${loginData.message || "No access token returned."}`);
-                    }
-                    sessionAuth.accessToken = accessToken;
-                    sessionAuth.refreshToken = loginData.refreshToken;
-                    // Auto-generate API key using the JWT access token (Chrome extension parity)
-                    const keyRes = await axios.post(`${CIVIFY_BASE_URL}/api-keys/auto-generate`, {}, {
-                        headers: {
-                            Authorization: `Bearer ${accessToken}`,
-                            Accept: "application/json",
-                        },
-                    });
-                    const rawKey = keyRes.data?.key;
-                    if (!rawKey) {
-                        throw new Error("Failed to auto-generate Civify API key for user session.");
-                    }
-                    sessionAuth.apiKey = rawKey;
-                    // Cache user profile
-                    try {
-                        const profileRes = await axios.get(`${CIVIFY_BASE_URL}/v1/external/cvs/user/profile`, {
-                            headers: { "X-API-KEY": rawKey, Accept: "application/json" },
+                    // ─── Login (Email/Password + Auto-Provision Key) ──────────
+                    case "civify_login": {
+                        const identifier = String(args?.identifier || "").trim();
+                        const password = String(args?.password || "").trim();
+                        if (!identifier || !password) {
+                            throw new Error("Both identifier (email or username) and password are required.");
+                        }
+                        const isEmail = identifier.includes("@");
+                        const payload = isEmail ? { email: identifier, password } : { username: identifier, password };
+                        const loginRes = await axios.post(`${CIVIFY_BASE_URL}/auth/login`, payload, {
+                            headers: { "Content-Type": "application/json", Accept: "application/json" },
                         });
-                        sessionAuth.userProfile = profileRes.data;
-                    }
-                    catch (_) { }
-                    return {
-                        content: [
-                            {
-                                type: "text",
-                                text: JSON.stringify({
-                                    status: "AUTHENTICATED",
-                                    message: "Login successful! API key auto-generated and active for this session.",
-                                    apiKeyPreview: rawKey.substring(0, 8) + "..." + rawKey.substring(rawKey.length - 4),
-                                    user: sessionAuth.userProfile || { email: identifier },
-                                }, null, 2),
+                        const loginData = loginRes.data;
+                        if (loginData.requires2FA) {
+                            sessionAuth.pending2faUsername = identifier;
+                            return {
+                                content: [
+                                    {
+                                        type: "text",
+                                        text: JSON.stringify({
+                                            status: "2FA_REQUIRED",
+                                            message: loginData.message || "2FA OTP sent to your email.",
+                                            username: identifier,
+                                            action_required: "Call 'civify_verify_2fa' with the OTP code sent to your email.",
+                                        }, null, 2),
+                                    },
+                                ],
+                            };
+                        }
+                        const accessToken = loginData.accessToken;
+                        if (!accessToken) {
+                            throw new Error(`Login failed: ${loginData.message || "No access token returned."}`);
+                        }
+                        sessionAuth.accessToken = accessToken;
+                        sessionAuth.refreshToken = loginData.refreshToken;
+                        // Auto-generate API key using the JWT access token (Chrome extension parity)
+                        const keyRes = await axios.post(`${CIVIFY_BASE_URL}/api-keys/auto-generate`, {}, {
+                            headers: {
+                                Authorization: `Bearer ${accessToken}`,
+                                Accept: "application/json",
                             },
-                        ],
-                    };
-                }
-                // ─── Verify 2FA ──────────────────────────────────────────
-                case "civify_verify_2fa": {
-                    const code = String(args?.code || "").trim();
-                    const username = String(args?.username || sessionAuth.pending2faUsername || "").trim();
-                    if (!code)
-                        throw new Error("Verification code is required.");
-                    if (!username) {
-                        throw new Error("Username or email is required. Please call civify_login first or provide the username parameter.");
-                    }
-                    const params = new URLSearchParams();
-                    params.append("username", username);
-                    params.append("code", code);
-                    const verifyRes = await axios.post(`${CIVIFY_BASE_URL}/auth/verify-otp`, params.toString(), {
-                        headers: {
-                            "Content-Type": "application/x-www-form-urlencoded",
-                            Accept: "application/json",
-                        },
-                    });
-                    const verifyData = verifyRes.data;
-                    const accessToken = verifyData.accessToken;
-                    if (!accessToken) {
-                        throw new Error(`2FA verification failed: ${verifyData.message || "Invalid OTP code."}`);
-                    }
-                    sessionAuth.accessToken = accessToken;
-                    sessionAuth.refreshToken = verifyData.refreshToken;
-                    sessionAuth.pending2faUsername = undefined;
-                    // Auto-generate key
-                    const keyRes = await axios.post(`${CIVIFY_BASE_URL}/api-keys/auto-generate`, {}, {
-                        headers: {
-                            Authorization: `Bearer ${accessToken}`,
-                            Accept: "application/json",
-                        },
-                    });
-                    const rawKey = keyRes.data?.key;
-                    if (!rawKey) {
-                        throw new Error("Failed to auto-generate Civify API key after 2FA verification.");
-                    }
-                    sessionAuth.apiKey = rawKey;
-                    try {
-                        const profileRes = await axios.get(`${CIVIFY_BASE_URL}/v1/external/cvs/user/profile`, {
-                            headers: { "X-API-KEY": rawKey, Accept: "application/json" },
                         });
-                        sessionAuth.userProfile = profileRes.data;
+                        const rawKey = keyRes.data?.key;
+                        if (!rawKey) {
+                            throw new Error("Failed to auto-generate Civify API key for user session.");
+                        }
+                        sessionAuth.apiKey = rawKey;
+                        // Cache user profile
+                        try {
+                            const profileRes = await axios.get(`${CIVIFY_BASE_URL}/v1/external/cvs/user/profile`, {
+                                headers: { "X-API-KEY": rawKey, Accept: "application/json" },
+                            });
+                            sessionAuth.userProfile = profileRes.data;
+                        }
+                        catch (_) { }
+                        return {
+                            content: [
+                                {
+                                    type: "text",
+                                    text: JSON.stringify({
+                                        status: "AUTHENTICATED",
+                                        message: "Login successful! API key auto-generated and active for this session.",
+                                        apiKeyPreview: rawKey.substring(0, 8) + "..." + rawKey.substring(rawKey.length - 4),
+                                        user: sessionAuth.userProfile || { email: identifier },
+                                    }, null, 2),
+                                },
+                            ],
+                        };
                     }
-                    catch (_) { }
-                    return {
-                        content: [
-                            {
-                                type: "text",
-                                text: JSON.stringify({
-                                    status: "AUTHENTICATED",
-                                    message: "2FA verified! API key provisioned and active for this session.",
-                                    apiKeyPreview: rawKey ? rawKey.substring(0, 8) + "..." : undefined,
-                                    user: sessionAuth.userProfile || { username },
-                                }, null, 2),
+                    // ─── Verify 2FA ──────────────────────────────────────────
+                    case "civify_verify_2fa": {
+                        const code = String(args?.code || "").trim();
+                        const username = String(args?.username || sessionAuth.pending2faUsername || "").trim();
+                        if (!code)
+                            throw new Error("Verification code is required.");
+                        if (!username) {
+                            throw new Error("Username or email is required. Please call civify_login first or provide the username parameter.");
+                        }
+                        const params = new URLSearchParams();
+                        params.append("username", username);
+                        params.append("code", code);
+                        const verifyRes = await axios.post(`${CIVIFY_BASE_URL}/auth/verify-otp`, params.toString(), {
+                            headers: {
+                                "Content-Type": "application/x-www-form-urlencoded",
+                                Accept: "application/json",
                             },
-                        ],
-                    };
-                }
-                // ─── Register ────────────────────────────────────────────
-                case "civify_register": {
-                    const email = String(args?.email || "").trim();
-                    const password = String(args?.password || "").trim();
-                    const username = String(args?.username || "").trim();
-                    const referralCode = args?.referral_code ? String(args.referral_code).trim() : undefined;
-                    if (!email || !password || !username) {
-                        throw new Error("Email, password, and username are all required.");
+                        });
+                        const verifyData = verifyRes.data;
+                        const accessToken = verifyData.accessToken;
+                        if (!accessToken) {
+                            throw new Error(`2FA verification failed: ${verifyData.message || "Invalid OTP code."}`);
+                        }
+                        sessionAuth.accessToken = accessToken;
+                        sessionAuth.refreshToken = verifyData.refreshToken;
+                        sessionAuth.pending2faUsername = undefined;
+                        // Auto-generate key
+                        const keyRes = await axios.post(`${CIVIFY_BASE_URL}/api-keys/auto-generate`, {}, {
+                            headers: {
+                                Authorization: `Bearer ${accessToken}`,
+                                Accept: "application/json",
+                            },
+                        });
+                        const rawKey = keyRes.data?.key;
+                        if (!rawKey) {
+                            throw new Error("Failed to auto-generate Civify API key after 2FA verification.");
+                        }
+                        sessionAuth.apiKey = rawKey;
+                        try {
+                            const profileRes = await axios.get(`${CIVIFY_BASE_URL}/v1/external/cvs/user/profile`, {
+                                headers: { "X-API-KEY": rawKey, Accept: "application/json" },
+                            });
+                            sessionAuth.userProfile = profileRes.data;
+                        }
+                        catch (_) { }
+                        return {
+                            content: [
+                                {
+                                    type: "text",
+                                    text: JSON.stringify({
+                                        status: "AUTHENTICATED",
+                                        message: "2FA verified! API key provisioned and active for this session.",
+                                        apiKeyPreview: rawKey ? rawKey.substring(0, 8) + "..." : undefined,
+                                        user: sessionAuth.userProfile || { username },
+                                    }, null, 2),
+                                },
+                            ],
+                        };
                     }
-                    const regRes = await axios.post(`${CIVIFY_BASE_URL}/auth/register`, { email, password, username, referralCode }, { headers: { "Content-Type": "application/json", Accept: "application/json" } });
-                    const regData = regRes.data;
-                    // Try instant auto-login (if verification is disabled or auto-verified in backend)
-                    try {
-                        const autoLoginRes = await axios.post(`${CIVIFY_BASE_URL}/auth/login`, { email, password }, { headers: { "Content-Type": "application/json", Accept: "application/json" } });
-                        if (autoLoginRes.data?.accessToken) {
-                            const accessToken = autoLoginRes.data.accessToken;
-                            sessionAuth.accessToken = accessToken;
-                            const keyRes = await axios.post(`${CIVIFY_BASE_URL}/api-keys/auto-generate`, {}, { headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" } });
-                            if (keyRes.data?.key) {
-                                const autoKey = String(keyRes.data.key);
-                                sessionAuth.apiKey = autoKey;
-                                return {
-                                    content: [
-                                        {
-                                            type: "text",
-                                            text: JSON.stringify({
-                                                status: "AUTHENTICATED",
-                                                message: "Registration successful and account verified! API key provisioned and active.",
-                                                apiKeyPreview: autoKey.substring(0, 8) + "...",
-                                            }, null, 2),
-                                        },
-                                    ],
-                                };
+                    // ─── Register ────────────────────────────────────────────
+                    case "civify_register": {
+                        const email = String(args?.email || "").trim();
+                        const password = String(args?.password || "").trim();
+                        const username = String(args?.username || "").trim();
+                        const referralCode = args?.referral_code ? String(args.referral_code).trim() : undefined;
+                        if (!email || !password || !username) {
+                            throw new Error("Email, password, and username are all required.");
+                        }
+                        const regRes = await axios.post(`${CIVIFY_BASE_URL}/auth/register`, { email, password, username, referralCode }, { headers: { "Content-Type": "application/json", Accept: "application/json" } });
+                        const regData = regRes.data;
+                        // Try instant auto-login (if verification is disabled or auto-verified in backend)
+                        try {
+                            const autoLoginRes = await axios.post(`${CIVIFY_BASE_URL}/auth/login`, { email, password }, { headers: { "Content-Type": "application/json", Accept: "application/json" } });
+                            if (autoLoginRes.data?.accessToken) {
+                                const accessToken = autoLoginRes.data.accessToken;
+                                sessionAuth.accessToken = accessToken;
+                                const keyRes = await axios.post(`${CIVIFY_BASE_URL}/api-keys/auto-generate`, {}, { headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" } });
+                                if (keyRes.data?.key) {
+                                    const autoKey = String(keyRes.data.key);
+                                    sessionAuth.apiKey = autoKey;
+                                    return {
+                                        content: [
+                                            {
+                                                type: "text",
+                                                text: JSON.stringify({
+                                                    status: "AUTHENTICATED",
+                                                    message: "Registration successful and account verified! API key provisioned and active.",
+                                                    apiKeyPreview: autoKey.substring(0, 8) + "...",
+                                                }, null, 2),
+                                            },
+                                        ],
+                                    };
+                                }
                             }
                         }
-                    }
-                    catch (_) {
-                        // Auto-login failed, requires email verification
-                    }
-                    return {
-                        content: [
-                            {
-                                type: "text",
-                                text: JSON.stringify({
-                                    status: "REGISTERED_VERIFICATION_REQUIRED",
-                                    message: regData.message || "Registration successful! A verification link has been sent to your email.",
-                                    action_required: "Please check your inbox, click the verification link, and then call 'civify_login' to connect.",
-                                }, null, 2),
-                            },
-                        ],
-                    };
-                }
-                // ─── Logout ──────────────────────────────────────────────
-                case "civify_logout": {
-                    sessionAuth.apiKey = undefined;
-                    sessionAuth.accessToken = undefined;
-                    sessionAuth.refreshToken = undefined;
-                    sessionAuth.pending2faUsername = undefined;
-                    sessionAuth.userProfile = undefined;
-                    return {
-                        content: [
-                            {
-                                type: "text",
-                                text: JSON.stringify({
-                                    status: "LOGGED_OUT",
-                                    message: "Active session credentials cleared.",
-                                }, null, 2),
-                            },
-                        ],
-                    };
-                }
-                // ─── Get Account Profile ─────────────────────────────────
-                case "civify_get_account": {
-                    const apiKey = ensureAuthenticated(sessionAuth, argApiKey);
-                    const client = getApiClient(sessionAuth, apiKey);
-                    const res = await client.get("/v1/external/cvs/user/profile");
-                    sessionAuth.userProfile = res.data;
-                    return {
-                        content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }],
-                    };
-                }
-                // ─── Get Pay-Per-CV Pricing ──────────────────────────────
-                case "civify_get_pay_per_cv_pricing": {
-                    const res = await axios.get(`${CIVIFY_BASE_URL}/v1/external/pay-per-cv/pricing`, {
-                        headers: { "User-Agent": `Civify-MCP-Server/${SERVER_VERSION}` },
-                    });
-                    return {
-                        content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }],
-                    };
-                }
-                // ─── Purchase Pay-Per-CV Pass ────────────────────────────
-                case "civify_purchase_cv_pass": {
-                    const apiKey = ensureAuthenticated(sessionAuth, argApiKey);
-                    const client = getApiClient(sessionAuth, apiKey);
-                    const res = await client.post("/v1/external/pay-per-cv/purchase", {
-                        productId: args?.product_id || "PAY_PER_CV_SINGLE",
-                        resumeId: args?.resume_id,
-                        gateway: args?.gateway,
-                        method: args?.method || "CARD",
-                        phoneNumber: args?.phone_number,
-                        promoCode: args?.promo_code,
-                    });
-                    return {
-                        content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }],
-                    };
-                }
-                // ─── Check CV Entitlement ────────────────────────────────
-                case "civify_check_cv_entitlement": {
-                    const apiKey = ensureAuthenticated(sessionAuth, argApiKey);
-                    const resumeId = String(args?.resume_id || "").trim();
-                    if (!resumeId)
-                        throw new Error("resume_id is required.");
-                    const client = getApiClient(sessionAuth, apiKey);
-                    const res = await client.get(`/v1/external/pay-per-cv/status?resumeId=${encodeURIComponent(resumeId)}`);
-                    return {
-                        content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }],
-                    };
-                }
-                // ─── Scrape Job ──────────────────────────────────────────
-                case "civify_scrape_job": {
-                    const url = String(args?.url || "").trim();
-                    if (!url)
-                        throw new Error("url is required.");
-                    const client = getApiClient(sessionAuth, argApiKey);
-                    const res = await client.post("/v1/external/cvs/scrape-jd", { url });
-                    return {
-                        content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }],
-                    };
-                }
-                // ─── Parse CV ────────────────────────────────────────────
-                case "civify_parse_cv": {
-                    const apiKey = ensureAuthenticated(sessionAuth, argApiKey);
-                    const client = getApiClient(sessionAuth, apiKey);
-                    const form = new FormData();
-                    if (args?.file_path) {
-                        const filePath = String(args.file_path);
-                        if (!fs.existsSync(filePath)) {
-                            throw new Error(`File not found: ${filePath}`);
+                        catch (_) {
+                            // Auto-login failed, requires email verification
                         }
-                        form.append("file", fs.createReadStream(filePath));
+                        return {
+                            content: [
+                                {
+                                    type: "text",
+                                    text: JSON.stringify({
+                                        status: "REGISTERED_VERIFICATION_REQUIRED",
+                                        message: regData.message || "Registration successful! A verification link has been sent to your email.",
+                                        action_required: "Please check your inbox, click the verification link, and then call 'civify_login' to connect.",
+                                    }, null, 2),
+                                },
+                            ],
+                        };
                     }
-                    else if (args?.file_base64) {
-                        const buffer = Buffer.from(String(args.file_base64), "base64");
-                        form.append("file", buffer, { filename: String(args?.filename || "resume.pdf") });
+                    // ─── Logout ──────────────────────────────────────────────
+                    case "civify_logout": {
+                        sessionAuth.apiKey = undefined;
+                        sessionAuth.accessToken = undefined;
+                        sessionAuth.refreshToken = undefined;
+                        sessionAuth.pending2faUsername = undefined;
+                        sessionAuth.userProfile = undefined;
+                        return {
+                            content: [
+                                {
+                                    type: "text",
+                                    text: JSON.stringify({
+                                        status: "LOGGED_OUT",
+                                        message: "Active session credentials cleared.",
+                                    }, null, 2),
+                                },
+                            ],
+                        };
                     }
-                    else {
-                        throw new Error("Either file_path or file_base64 is required.");
+                    // ─── Get Account Profile ─────────────────────────────────
+                    case "civify_get_account": {
+                        const apiKey = ensureAuthenticated(sessionAuth, argApiKey);
+                        const client = getApiClient(sessionAuth, apiKey);
+                        const res = await client.get("/v1/external/cvs/user/profile");
+                        sessionAuth.userProfile = res.data;
+                        return {
+                            content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }],
+                        };
                     }
-                    if (args?.language) {
-                        form.append("language", String(args.language));
-                    }
-                    const res = await client.post("/v1/external/cvs/parse", form, {
-                        headers: form.getHeaders(),
-                    });
-                    return {
-                        content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }],
-                    };
-                }
-                // ─── Tailor CV ───────────────────────────────────────────
-                case "civify_tailor_cv": {
-                    const apiKey = ensureAuthenticated(sessionAuth, argApiKey);
-                    const client = getApiClient(sessionAuth, apiKey);
-                    const form = new FormData();
-                    if (args?.file_path) {
-                        const filePath = String(args.file_path);
-                        if (!fs.existsSync(filePath)) {
-                            throw new Error(`File not found: ${filePath}`);
-                        }
-                        form.append("file", fs.createReadStream(filePath));
-                    }
-                    else if (args?.file_base64) {
-                        const buffer = Buffer.from(String(args.file_base64), "base64");
-                        form.append("file", buffer, { filename: String(args?.filename || "resume.pdf") });
-                    }
-                    else {
-                        throw new Error("Either file_path or file_base64 is required to tailor CV.");
-                    }
-                    form.append("jobDescription", String(args?.job_description || ""));
-                    if (args?.job_title)
-                        form.append("jobTitle", String(args.job_title));
-                    if (args?.company_name)
-                        form.append("companyName", String(args.company_name));
-                    if (args?.language)
-                        form.append("language", String(args.language));
-                    if (args?.generate_cover_letter)
-                        form.append("generateCoverLetter", "true");
-                    if (args?.include_interview_questions)
-                        form.append("includeInterviewQuestions", "true");
-                    if (args?.include_roadmap)
-                        form.append("includeRoadmap", "true");
-                    const res = await client.post("/v1/external/cvs/tailor", form, {
-                        headers: form.getHeaders(),
-                    });
-                    const mdReport = formatTailorCvMarkdown(res.data, args?.job_title ? String(args.job_title) : undefined, args?.company_name ? String(args.company_name) : undefined);
-                    return {
-                        content: [
-                            { type: "text", text: mdReport },
-                            { type: "text", text: JSON.stringify(res.data, null, 2) },
-                        ],
-                    };
-                }
-                // ─── Score ATS ───────────────────────────────────────────
-                case "civify_score_ats": {
-                    const apiKey = ensureAuthenticated(sessionAuth, argApiKey);
-                    const client = getApiClient(sessionAuth, apiKey);
-                    let resumeData = args?.resume_data;
-                    if (!resumeData && args?.file_path) {
-                        const filePath = String(args.file_path);
-                        if (!fs.existsSync(filePath)) {
-                            throw new Error(`File not found: ${filePath}`);
-                        }
-                        const parseForm = new FormData();
-                        parseForm.append("file", fs.createReadStream(filePath));
-                        const parseRes = await client.post("/v1/external/cvs/parse", parseForm, {
-                            headers: parseForm.getHeaders(),
+                    // ─── Get Pay-Per-CV Pricing ──────────────────────────────
+                    case "civify_get_pay_per_cv_pricing": {
+                        const res = await axios.get(`${CIVIFY_BASE_URL}/v1/external/pay-per-cv/pricing`, {
+                            headers: { "User-Agent": `Civify-MCP-Server/${SERVER_VERSION}` },
                         });
-                        resumeData = parseRes.data?.data || parseRes.data;
+                        return {
+                            content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }],
+                        };
                     }
-                    if (!resumeData) {
-                        throw new Error("Either resume_data object or file_path document is required to calculate ATS score.");
+                    // ─── Purchase Pay-Per-CV Pass ────────────────────────────
+                    case "civify_purchase_cv_pass": {
+                        const apiKey = ensureAuthenticated(sessionAuth, argApiKey);
+                        const client = getApiClient(sessionAuth, apiKey);
+                        const res = await client.post("/v1/external/pay-per-cv/purchase", {
+                            productId: args?.product_id || "PAY_PER_CV_SINGLE",
+                            resumeId: args?.resume_id,
+                            gateway: args?.gateway,
+                            method: args?.method || "CARD",
+                            phoneNumber: args?.phone_number,
+                            promoCode: args?.promo_code,
+                        });
+                        return {
+                            content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }],
+                        };
                     }
-                    const res = await client.post("/v1/external/cvs/score", { resumeData });
-                    const mdScore = formatAtsScoreMarkdown(res.data);
-                    return {
-                        content: [
-                            { type: "text", text: mdScore },
-                            { type: "text", text: JSON.stringify(res.data, null, 2) },
-                        ],
-                    };
-                }
-                // ─── Mask PII ────────────────────────────────────────────
-                case "civify_mask_pii": {
-                    const apiKey = ensureAuthenticated(sessionAuth, argApiKey);
-                    const client = getApiClient(sessionAuth, apiKey);
-                    const form = new FormData();
-                    let defaultOutName = "masked_cv.pdf";
-                    if (args?.file_path) {
-                        const filePath = String(args.file_path);
-                        if (!fs.existsSync(filePath)) {
-                            throw new Error(`File not found: ${filePath}`);
+                    // ─── Check CV Entitlement ────────────────────────────────
+                    case "civify_check_cv_entitlement": {
+                        const apiKey = ensureAuthenticated(sessionAuth, argApiKey);
+                        const resumeId = String(args?.resume_id || "").trim();
+                        if (!resumeId)
+                            throw new Error("resume_id is required.");
+                        const client = getApiClient(sessionAuth, apiKey);
+                        const res = await client.get(`/v1/external/pay-per-cv/status?resumeId=${encodeURIComponent(resumeId)}`);
+                        return {
+                            content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }],
+                        };
+                    }
+                    // ─── Scrape Job ──────────────────────────────────────────
+                    case "civify_scrape_job": {
+                        const url = String(args?.url || "").trim();
+                        if (!url)
+                            throw new Error("url is required.");
+                        const client = getApiClient(sessionAuth, argApiKey);
+                        const res = await client.post("/v1/external/cvs/scrape-jd", { url });
+                        return {
+                            content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }],
+                        };
+                    }
+                    // ─── Parse CV ────────────────────────────────────────────
+                    case "civify_parse_cv": {
+                        const apiKey = ensureAuthenticated(sessionAuth, argApiKey);
+                        const client = getApiClient(sessionAuth, apiKey);
+                        const form = new FormData();
+                        if (args?.file_path) {
+                            const filePath = String(args.file_path);
+                            if (!fs.existsSync(filePath)) {
+                                throw new Error(`File not found: ${filePath}`);
+                            }
+                            form.append("file", fs.createReadStream(filePath));
                         }
-                        form.append("file", fs.createReadStream(filePath));
-                        defaultOutName = filePath.replace(/\.[^/.]+$/, "_masked.pdf");
+                        else if (args?.file_base64) {
+                            const buffer = Buffer.from(String(args.file_base64), "base64");
+                            form.append("file", buffer, { filename: String(args?.filename || "resume.pdf") });
+                        }
+                        else {
+                            throw new Error("Either file_path or file_base64 is required.");
+                        }
+                        if (args?.language) {
+                            form.append("language", String(args.language));
+                        }
+                        const res = await client.post("/v1/external/cvs/parse", form, {
+                            headers: form.getHeaders(),
+                        });
+                        return {
+                            content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }],
+                        };
                     }
-                    else if (args?.file_base64) {
-                        const buffer = Buffer.from(String(args.file_base64), "base64");
-                        form.append("file", buffer, { filename: String(args?.filename || "resume.pdf") });
-                    }
-                    else {
-                        throw new Error("Either file_path or file_base64 is required.");
-                    }
-                    const res = await client.post("/v1/external/cvs/mask", form, {
-                        headers: form.getHeaders(),
-                        responseType: "arraybuffer",
-                    });
-                    const outPath = String(args?.output_path || defaultOutName);
-                    try {
-                        fs.writeFileSync(outPath, Buffer.from(res.data));
+                    // ─── Tailor CV ───────────────────────────────────────────
+                    case "civify_tailor_cv": {
+                        const apiKey = ensureAuthenticated(sessionAuth, argApiKey);
+                        const client = getApiClient(sessionAuth, apiKey);
+                        const form = new FormData();
+                        if (args?.file_path) {
+                            const filePath = String(args.file_path);
+                            if (!fs.existsSync(filePath)) {
+                                throw new Error(`File not found: ${filePath}`);
+                            }
+                            form.append("file", fs.createReadStream(filePath));
+                        }
+                        else if (args?.file_base64) {
+                            const buffer = Buffer.from(String(args.file_base64), "base64");
+                            form.append("file", buffer, { filename: String(args?.filename || "resume.pdf") });
+                        }
+                        else {
+                            throw new Error("Either file_path or file_base64 is required to tailor CV.");
+                        }
+                        form.append("jobDescription", String(args?.job_description || ""));
+                        if (args?.job_title)
+                            form.append("jobTitle", String(args.job_title));
+                        if (args?.company_name)
+                            form.append("companyName", String(args.company_name));
+                        if (args?.language)
+                            form.append("language", String(args.language));
+                        if (args?.generate_cover_letter)
+                            form.append("generateCoverLetter", "true");
+                        if (args?.include_interview_questions)
+                            form.append("includeInterviewQuestions", "true");
+                        if (args?.include_roadmap)
+                            form.append("includeRoadmap", "true");
+                        const res = await client.post("/v1/external/cvs/tailor", form, {
+                            headers: form.getHeaders(),
+                        });
+                        const mdReport = formatTailorCvMarkdown(res.data, args?.job_title ? String(args.job_title) : undefined, args?.company_name ? String(args.company_name) : undefined);
                         return {
                             content: [
-                                {
-                                    type: "text",
-                                    text: JSON.stringify({
-                                        status: "SUCCESS",
-                                        message: `Sanitized masked PDF saved to ${outPath}`,
-                                        path: outPath,
-                                    }, null, 2),
-                                },
+                                { type: "text", text: mdReport },
+                                { type: "text", text: JSON.stringify(res.data, null, 2) },
                             ],
                         };
                     }
-                    catch (_) {
+                    // ─── Score ATS ───────────────────────────────────────────
+                    case "civify_score_ats": {
+                        const apiKey = ensureAuthenticated(sessionAuth, argApiKey);
+                        const client = getApiClient(sessionAuth, apiKey);
+                        let resumeData = args?.resume_data;
+                        if (!resumeData && args?.file_path) {
+                            const filePath = String(args.file_path);
+                            if (!fs.existsSync(filePath)) {
+                                throw new Error(`File not found: ${filePath}`);
+                            }
+                            const parseForm = new FormData();
+                            parseForm.append("file", fs.createReadStream(filePath));
+                            const parseRes = await client.post("/v1/external/cvs/parse", parseForm, {
+                                headers: parseForm.getHeaders(),
+                            });
+                            resumeData = parseRes.data?.data || parseRes.data;
+                        }
+                        if (!resumeData) {
+                            throw new Error("Either resume_data object or file_path document is required to calculate ATS score.");
+                        }
+                        const res = await client.post("/v1/external/cvs/score", { resumeData });
+                        const mdScore = formatAtsScoreMarkdown(res.data);
                         return {
                             content: [
-                                {
-                                    type: "text",
-                                    text: JSON.stringify({
-                                        status: "SUCCESS",
-                                        message: "Masked PDF generated successfully.",
-                                        pdf_base64: Buffer.from(res.data).toString("base64"),
-                                    }, null, 2),
-                                },
+                                { type: "text", text: mdScore },
+                                { type: "text", text: JSON.stringify(res.data, null, 2) },
                             ],
                         };
                     }
-                }
-                // ─── Generate PDF ────────────────────────────────────────
-                case "civify_generate_pdf": {
-                    const resumeData = args?.resume_data;
-                    if (!resumeData) {
-                        throw new Error("resume_data is required.");
+                    // ─── Mask PII ────────────────────────────────────────────
+                    case "civify_mask_pii": {
+                        const apiKey = ensureAuthenticated(sessionAuth, argApiKey);
+                        const client = getApiClient(sessionAuth, apiKey);
+                        const form = new FormData();
+                        let defaultOutName = "masked_cv.pdf";
+                        if (args?.file_path) {
+                            const filePath = String(args.file_path);
+                            if (!fs.existsSync(filePath)) {
+                                throw new Error(`File not found: ${filePath}`);
+                            }
+                            form.append("file", fs.createReadStream(filePath));
+                            defaultOutName = filePath.replace(/\.[^/.]+$/, "_masked.pdf");
+                        }
+                        else if (args?.file_base64) {
+                            const buffer = Buffer.from(String(args.file_base64), "base64");
+                            form.append("file", buffer, { filename: String(args?.filename || "resume.pdf") });
+                        }
+                        else {
+                            throw new Error("Either file_path or file_base64 is required.");
+                        }
+                        const res = await client.post("/v1/external/cvs/mask", form, {
+                            headers: form.getHeaders(),
+                            responseType: "arraybuffer",
+                        });
+                        const outPath = String(args?.output_path || defaultOutName);
+                        try {
+                            fs.writeFileSync(outPath, Buffer.from(res.data));
+                            return {
+                                content: [
+                                    {
+                                        type: "text",
+                                        text: JSON.stringify({
+                                            status: "SUCCESS",
+                                            message: `Sanitized masked PDF saved to ${outPath}`,
+                                            path: outPath,
+                                        }, null, 2),
+                                    },
+                                ],
+                            };
+                        }
+                        catch (_) {
+                            return {
+                                content: [
+                                    {
+                                        type: "text",
+                                        text: JSON.stringify({
+                                            status: "SUCCESS",
+                                            message: "Masked PDF generated successfully.",
+                                            pdf_base64: Buffer.from(res.data).toString("base64"),
+                                        }, null, 2),
+                                    },
+                                ],
+                            };
+                        }
                     }
-                    const template = String(args?.template || "modern");
-                    const color = String(args?.color || "#000000");
-                    const filename = String(args?.filename || "resume");
-                    const res = await axios.post(`${CIVIFY_FRONTEND_URL}/api/generate-pdf`, {
-                        resumeData,
-                        template,
-                        color,
-                        filename,
-                    }, {
-                        responseType: "arraybuffer",
-                        timeout: 60000,
-                    });
-                    const outPath = String(args?.output_path || `${filename}.pdf`);
-                    try {
-                        fs.writeFileSync(outPath, Buffer.from(res.data));
+                    // ─── Generate PDF ────────────────────────────────────────
+                    case "civify_generate_pdf": {
+                        const resumeData = args?.resume_data;
+                        if (!resumeData) {
+                            throw new Error("resume_data is required.");
+                        }
+                        const template = String(args?.template || "modern");
+                        const color = String(args?.color || "#000000");
+                        const filename = String(args?.filename || "resume");
+                        const res = await axios.post(`${CIVIFY_FRONTEND_URL}/api/generate-pdf`, {
+                            resumeData,
+                            template,
+                            color,
+                            filename,
+                        }, {
+                            responseType: "arraybuffer",
+                            timeout: 60000,
+                        });
+                        const outPath = String(args?.output_path || `${filename}.pdf`);
+                        try {
+                            fs.writeFileSync(outPath, Buffer.from(res.data));
+                            return {
+                                content: [
+                                    {
+                                        type: "text",
+                                        text: JSON.stringify({
+                                            status: "SUCCESS",
+                                            message: `Generated PDF saved to ${outPath}`,
+                                            path: outPath,
+                                        }, null, 2),
+                                    },
+                                ],
+                            };
+                        }
+                        catch (_) {
+                            return {
+                                content: [
+                                    {
+                                        type: "text",
+                                        text: JSON.stringify({
+                                            status: "SUCCESS",
+                                            message: "PDF generated successfully.",
+                                            pdf_base64: Buffer.from(res.data).toString("base64"),
+                                        }, null, 2),
+                                    },
+                                ],
+                            };
+                        }
+                    }
+                    // ─── Track Application ───────────────────────────────────
+                    case "civify_track_application": {
+                        const apiKey = ensureAuthenticated(sessionAuth, argApiKey);
+                        const client = getApiClient(sessionAuth, apiKey);
+                        const res = await client.post("/v1/external/job-applications", {
+                            companyName: args?.company_name,
+                            jobTitle: args?.job_title,
+                            jobUrl: args?.job_url,
+                            status: args?.status || "APPLIED",
+                            notes: args?.notes,
+                        });
                         return {
-                            content: [
-                                {
-                                    type: "text",
-                                    text: JSON.stringify({
-                                        status: "SUCCESS",
-                                        message: `Generated PDF saved to ${outPath}`,
-                                        path: outPath,
-                                    }, null, 2),
-                                },
-                            ],
+                            content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }],
                         };
                     }
-                    catch (_) {
+                    // ─── List Applications ───────────────────────────────────
+                    case "civify_list_applications": {
+                        const apiKey = ensureAuthenticated(sessionAuth, argApiKey);
+                        const client = getApiClient(sessionAuth, apiKey);
+                        const res = await client.get("/v1/external/job-applications");
                         return {
-                            content: [
-                                {
-                                    type: "text",
-                                    text: JSON.stringify({
-                                        status: "SUCCESS",
-                                        message: "PDF generated successfully.",
-                                        pdf_base64: Buffer.from(res.data).toString("base64"),
-                                    }, null, 2),
-                                },
-                            ],
+                            content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }],
                         };
                     }
+                    default:
+                        throw new Error(`Unknown tool: ${name}`);
                 }
-                // ─── Track Application ───────────────────────────────────
-                case "civify_track_application": {
-                    const apiKey = ensureAuthenticated(sessionAuth, argApiKey);
-                    const client = getApiClient(sessionAuth, apiKey);
-                    const res = await client.post("/v1/external/job-applications", {
-                        companyName: args?.company_name,
-                        jobTitle: args?.job_title,
-                        jobUrl: args?.job_url,
-                        status: args?.status || "APPLIED",
-                        notes: args?.notes,
-                    });
-                    return {
-                        content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }],
-                    };
-                }
-                // ─── List Applications ───────────────────────────────────
-                case "civify_list_applications": {
-                    const apiKey = ensureAuthenticated(sessionAuth, argApiKey);
-                    const client = getApiClient(sessionAuth, apiKey);
-                    const res = await client.get("/v1/external/job-applications");
-                    return {
-                        content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }],
-                    };
-                }
-                default:
-                    throw new Error(`Unknown tool: ${name}`);
-            }
+            };
+            const result = await executeTool();
+            const duration = Date.now() - startTime;
+            console.log(`[MCP Tool Response] ✅ ${name} completed (${duration}ms)`);
+            return result;
         }
         catch (error) {
+            const duration = Date.now() - startTime;
             const errorMsg = error?.response?.data
                 ? typeof error.response.data === "string"
                     ? error.response.data
                     : JSON.stringify(error.response.data)
                 : error.message;
+            console.error(`[MCP Tool Error] ❌ ${name} failed (${duration}ms): ${errorMsg}`);
             return {
                 content: [{ type: "text", text: `Civify MCP Error: ${errorMsg}` }],
                 isError: true,
@@ -1613,6 +1766,25 @@ async function runSse(listenPort) {
     const app = express();
     app.use(cors({ origin: "*" }));
     app.use(express.json());
+    // ─── Traffic Logging Middleware (Observability for Docker/Dokploy) ──
+    app.use((req, res, next) => {
+        // Skip health probe to avoid polluting logs
+        if (req.path === "/health")
+            return next();
+        const start = Date.now();
+        const sessionId = req.headers["mcp-session-id"] ||
+            req.query.sessionId ||
+            "-";
+        const rpcInfo = req.body?.method
+            ? `[rpc: ${req.body.method}${req.body?.params?.name ? ` -> ${req.body.params.name}` : ""}]`
+            : "";
+        console.log(`[MCP HTTP In] ${req.method} ${req.originalUrl || req.url} ${rpcInfo} (session: ${sessionId})`);
+        res.on("finish", () => {
+            const duration = Date.now() - start;
+            console.log(`[MCP HTTP Out] ${req.method} ${req.originalUrl || req.url} ${rpcInfo} → HTTP ${res.statusCode} (${duration}ms)`);
+        });
+        next();
+    });
     // Legacy SSE transport sessions
     const sseTransports = new Map();
     // Streamable HTTP transport sessions (new MCP standard)
