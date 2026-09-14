@@ -1,6 +1,7 @@
 # Civify Model Context Protocol (MCP) Server
 
 [![npm version](https://img.shields.io/npm/v/@civify/mcp-server.svg)](https://www.npmjs.com/package/@civify/mcp-server)
+[![smithery badge](https://smithery.ai/badge/technolabs/civify)](https://smithery.ai/servers/technolabs/civify)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
 Official [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server for the **[Civify Career Platform](https://civify.cv)**. 
@@ -131,7 +132,7 @@ No hardcoded or static API key is required at startup. The MCP server supports i
 
 ## 🌟 Registry Listings
 
-- **Smithery:** Add your repository URL on [https://smithery.ai](https://smithery.ai) for 1-click install.
+- **Smithery:** [https://smithery.ai/servers/technolabs/civify](https://smithery.ai/servers/technolabs/civify)
 - **Glama:** List on [https://glama.ai/mcp/servers](https://glama.ai/mcp/servers).
 - **PulseMCP:** Listed in the curated registry at [https://pulsemcp.com](https://pulsemcp.com).
 
