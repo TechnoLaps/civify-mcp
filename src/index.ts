@@ -269,7 +269,7 @@ const CIVIFY_BASE_URL = process.env.CIVIFY_API_URL || "https://civify.cv/apis";
 const CIVIFY_FRONTEND_URL = process.env.CIVIFY_FRONTEND_URL || "https://civify.cv";
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : null;
 const IS_SSE = process.argv.includes("--sse") || process.env.TRANSPORT === "sse" || PORT !== null;
-const SERVER_VERSION = "1.3.2";
+const SERVER_VERSION = "1.3.3";
 
 /**
  * Session Authentication State
@@ -358,8 +358,13 @@ const appendResumeInput = (form: FormData, args: any): boolean => {
     return true;
   }
 
-  if (typeof args?.file_path === "string" && args.file_path.trim()) {
-    const filePath = args.file_path.trim();
+  const filePathCandidate =
+    (typeof args?.server_file_path === "string" && args.server_file_path.trim()) ||
+    (typeof args?.file_path === "string" && args.file_path.trim()) ||
+    undefined;
+
+  if (filePathCandidate) {
+    const filePath = filePathCandidate.trim();
     if (!fs.existsSync(filePath)) {
       throw new Error(
         `File not found on server: "${filePath}".\n` +
@@ -938,9 +943,9 @@ const TOOLS: Tool[] = [
           type: "string",
           description: "Base64 encoded content of the resume document (PDF, DOCX). Recommended for remote/cloud MCP servers.",
         },
-        file_path: {
+        server_file_path: {
           type: "string",
-          description: "Local file path on the MCP server machine. Do NOT use for remote cloud servers; use 'resume_text' or 'file_base64' instead.",
+          description: "Local file path on the MCP server machine. For local CLI/stdio usage only. In ChatGPT or Claude, pass 'resume_text' or 'file_base64' instead.",
         },
         filename: {
           type: "string",
@@ -960,7 +965,7 @@ const TOOLS: Tool[] = [
       anyOf: [
         { required: ["resume_text"] },
         { required: ["file_base64"] },
-        { required: ["file_path"] },
+        { required: ["server_file_path"] },
       ],
     },
     outputSchema: {
@@ -1023,9 +1028,9 @@ const TOOLS: Tool[] = [
           type: "string",
           description: "Base64 encoded resume file content (PDF, DOCX). Recommended for remote/cloud MCP servers.",
         },
-        file_path: {
+        server_file_path: {
           type: "string",
-          description: "Local file path on the MCP server machine. Do NOT use for remote cloud servers; use 'resume_text' or 'file_base64' instead.",
+          description: "Local file path on the MCP server machine. For local CLI/stdio usage only. In ChatGPT or Claude, pass 'resume_text' or 'file_base64' instead.",
         },
         filename: {
           type: "string",
@@ -1072,7 +1077,7 @@ const TOOLS: Tool[] = [
       anyOf: [
         { required: ["resume_text"] },
         { required: ["file_base64"] },
-        { required: ["file_path"] },
+        { required: ["server_file_path"] },
       ],
     },
     outputSchema: {
@@ -1133,9 +1138,9 @@ const TOOLS: Tool[] = [
           type: "string",
           description: "Base64 encoded content of the resume document (PDF, DOCX). Recommended for remote/cloud MCP servers.",
         },
-        file_path: {
+        server_file_path: {
           type: "string",
-          description: "Local file path on the MCP server machine. Do NOT use for remote cloud servers; use 'resume_text' or 'file_base64' instead.",
+          description: "Local file path on the MCP server machine. For local CLI/stdio usage only. In ChatGPT or Claude, pass 'resume_text' or 'file_base64' instead.",
         },
         filename: {
           type: "string",
@@ -1154,7 +1159,7 @@ const TOOLS: Tool[] = [
       anyOf: [
         { required: ["resume_text"] },
         { required: ["file_base64"] },
-        { required: ["file_path"] },
+        { required: ["server_file_path"] },
         { required: ["resume_data"] },
       ],
     },
@@ -1197,17 +1202,17 @@ const TOOLS: Tool[] = [
     inputSchema: {
       type: "object",
       properties: {
-        file_path: {
-          type: "string",
-          description: "Path to resume file to redact.",
-        },
         file_base64: {
           type: "string",
-          description: "Base64 encoded resume file.",
+          description: "Base64 encoded resume file (PDF, DOCX). Recommended for remote/cloud MCP servers.",
+        },
+        server_file_path: {
+          type: "string",
+          description: "Local file path on the MCP server machine. For local CLI/stdio usage only. In ChatGPT or Claude, pass 'file_base64' instead.",
         },
         output_path: {
           type: "string",
-          description: "Optional destination path to save the masked PDF.",
+          description: "Optional destination path on the server to save the masked PDF.",
         },
         api_key: {
           type: "string",
@@ -1888,8 +1893,16 @@ export const createMcpServer = (sessionAuth: SessionAuthState) => {
 
           const form = new FormData();
           let defaultOutName = "masked_cv.pdf";
-          if (args?.file_path) {
-            const filePath = String(args.file_path);
+          const filePathCandidate =
+            (typeof args?.server_file_path === "string" && args.server_file_path.trim()) ||
+            (typeof args?.file_path === "string" && args.file_path.trim()) ||
+            undefined;
+
+          if (args?.file_base64) {
+            const buffer = Buffer.from(String(args.file_base64), "base64");
+            form.append("file", buffer, { filename: String(args?.filename || "resume.pdf") });
+          } else if (filePathCandidate) {
+            const filePath = filePathCandidate.trim();
             if (!fs.existsSync(filePath)) {
               throw new Error(
                 `File not found on server: "${filePath}".\n` +
@@ -1899,11 +1912,8 @@ export const createMcpServer = (sessionAuth: SessionAuthState) => {
             }
             form.append("file", fs.createReadStream(filePath));
             defaultOutName = filePath.replace(/\.[^/.]+$/, "_masked.pdf");
-          } else if (args?.file_base64) {
-            const buffer = Buffer.from(String(args.file_base64), "base64");
-            form.append("file", buffer, { filename: String(args?.filename || "resume.pdf") });
           } else {
-            throw new Error("Either file_base64 or file_path is required.");
+            throw new Error("Please provide the resume via 'file_base64' (Base64 encoded string) or 'server_file_path'.");
           }
 
           const res = await client.post("/v1/external/cvs/mask", form, {
