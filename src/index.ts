@@ -269,7 +269,7 @@ const CIVIFY_BASE_URL = process.env.CIVIFY_API_URL || "https://civify.cv/apis";
 const CIVIFY_FRONTEND_URL = process.env.CIVIFY_FRONTEND_URL || "https://civify.cv";
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : null;
 const IS_SSE = process.argv.includes("--sse") || process.env.TRANSPORT === "sse" || PORT !== null;
-const SERVER_VERSION = "1.3.1";
+const SERVER_VERSION = "1.3.2";
 
 /**
  * Session Authentication State
@@ -304,7 +304,7 @@ const getApiClient = (sessionAuth: SessionAuthState, overrideKey?: string): Axio
 
 const ensureAuthenticated = (sessionAuth: SessionAuthState, overrideKey?: string): string => {
   const key = overrideKey || sessionAuth.apiKey;
-  if (!key) {
+  if (!key && !sessionAuth.accessToken) {
     throw new Error(
       "UNAUTHENTICATED: No active Civify credentials found for this session.\n" +
       "To authenticate, please perform one of the following:\n" +
@@ -313,7 +313,80 @@ const ensureAuthenticated = (sessionAuth: SessionAuthState, overrideKey?: string
       "3. If you do not have an account yet, create one using the 'civify_register' tool."
     );
   }
-  return key;
+  return key || "";
+};
+
+const safeFilename = (value: unknown, fallback = "resume.pdf"): string => {
+  if (typeof value !== "string" || !value.trim()) return fallback;
+
+  const filename = path.basename(value.trim()).replace(/[\x00-\x1F<>:"/\\|?*]/g, "_");
+  return filename || fallback;
+};
+
+/**
+ * Adds exactly one resume input to a multipart form. Remote MCP clients should
+ * use resume_text or file_base64; file_path is only valid for a local server.
+ */
+const appendResumeInput = (form: FormData, args: any): boolean => {
+  if (typeof args?.resume_text === "string" && args.resume_text.trim()) {
+    form.append("file", Buffer.from(args.resume_text, "utf-8"), {
+      filename: "resume.txt",
+      contentType: "text/plain",
+    });
+    return true;
+  }
+
+  if (typeof args?.file_base64 === "string" && args.file_base64.trim()) {
+    const rawValue = args.file_base64.trim();
+    const dataUri = rawValue.match(/^data:[^;,]+;base64,([\s\S]*)$/i);
+    const normalized = (dataUri ? dataUri[1] : rawValue).replace(/\s/g, "");
+
+    if (
+      !normalized ||
+      normalized.length % 4 !== 0 ||
+      !/^[A-Za-z0-9+/]*={0,2}$/.test(normalized)
+    ) {
+      throw new Error("file_base64 must be a valid Base64-encoded document.");
+    }
+
+    const buffer = Buffer.from(normalized, "base64");
+    if (buffer.length === 0) {
+      throw new Error("file_base64 must contain a non-empty document.");
+    }
+
+    form.append("file", buffer, { filename: safeFilename(args?.filename) });
+    return true;
+  }
+
+  if (typeof args?.file_path === "string" && args.file_path.trim()) {
+    const filePath = args.file_path.trim();
+    if (!fs.existsSync(filePath)) {
+      throw new Error(
+        `File not found on server: "${filePath}".\n` +
+          "Note: A remote cloud MCP server cannot access files in your local sandbox.\n" +
+          "Please provide the resume using 'resume_text' (plain text/markdown) or 'file_base64' (Base64 string)."
+      );
+    }
+    form.append("file", fs.createReadStream(filePath));
+    return true;
+  }
+
+  return false;
+};
+
+const getInitialSessionAuth = (request: express.Request): SessionAuthState => {
+  const explicitApiKey = request.header("x-api-key")?.trim();
+  if (explicitApiKey) return { apiKey: explicitApiKey };
+
+  const authorization = request.header("authorization")?.trim();
+  const bearerToken = authorization?.replace(/^Bearer\s+/i, "").trim();
+  if (!bearerToken) return {};
+
+  // Some clients send API keys as Bearer credentials; JWTs must instead be
+  // forwarded using Authorization so the backend can authenticate them.
+  return bearerToken.startsWith("cv-fy-")
+    ? { apiKey: bearerToken }
+    : { accessToken: bearerToken };
 };
 
 const renderProgressBar = (score: number): string => {
@@ -857,13 +930,17 @@ const TOOLS: Tool[] = [
     inputSchema: {
       type: "object",
       properties: {
-        file_path: {
+        resume_text: {
           type: "string",
-          description: "Local file path to the resume document (PDF, DOCX, image).",
+          description: "Plain text or markdown content of the resume. Easiest option when chatting with an AI agent.",
         },
         file_base64: {
           type: "string",
-          description: "Base64 encoded content of the resume document (for remote/browser agents).",
+          description: "Base64 encoded content of the resume document (PDF, DOCX). Recommended for remote/cloud MCP servers.",
+        },
+        file_path: {
+          type: "string",
+          description: "Local file path on the MCP server machine. Do NOT use for remote cloud servers; use 'resume_text' or 'file_base64' instead.",
         },
         filename: {
           type: "string",
@@ -880,6 +957,11 @@ const TOOLS: Tool[] = [
           description: "Optional API key override.",
         },
       },
+      anyOf: [
+        { required: ["resume_text"] },
+        { required: ["file_base64"] },
+        { required: ["file_path"] },
+      ],
     },
     outputSchema: {
       type: "object",
@@ -933,17 +1015,21 @@ const TOOLS: Tool[] = [
     inputSchema: {
       type: "object",
       properties: {
-        file_path: {
+        resume_text: {
           type: "string",
-          description: "Path to resume document file to tailor.",
+          description: "Plain text or markdown content of the candidate's resume. Easiest option when chatting with an AI agent.",
         },
         file_base64: {
           type: "string",
-          description: "Base64 encoded resume file content.",
+          description: "Base64 encoded resume file content (PDF, DOCX). Recommended for remote/cloud MCP servers.",
+        },
+        file_path: {
+          type: "string",
+          description: "Local file path on the MCP server machine. Do NOT use for remote cloud servers; use 'resume_text' or 'file_base64' instead.",
         },
         filename: {
           type: "string",
-          description: "Filename when providing base64 content.",
+          description: "Filename when providing base64 content (e.g. 'resume.pdf').",
           default: "resume.pdf",
         },
         job_description: {
@@ -983,6 +1069,11 @@ const TOOLS: Tool[] = [
         },
       },
       required: ["job_description"],
+      anyOf: [
+        { required: ["resume_text"] },
+        { required: ["file_base64"] },
+        { required: ["file_path"] },
+      ],
     },
     outputSchema: {
       type: "object",
@@ -1034,9 +1125,22 @@ const TOOLS: Tool[] = [
     inputSchema: {
       type: "object",
       properties: {
+        resume_text: {
+          type: "string",
+          description: "Plain text or markdown content of the resume. Easiest option when chatting with an AI agent.",
+        },
+        file_base64: {
+          type: "string",
+          description: "Base64 encoded content of the resume document (PDF, DOCX). Recommended for remote/cloud MCP servers.",
+        },
         file_path: {
           type: "string",
-          description: "Path to resume document to score (auto-parsed first).",
+          description: "Local file path on the MCP server machine. Do NOT use for remote cloud servers; use 'resume_text' or 'file_base64' instead.",
+        },
+        filename: {
+          type: "string",
+          description: "Filename when providing base64 (e.g. 'resume.pdf').",
+          default: "resume.pdf",
         },
         resume_data: {
           type: "object",
@@ -1047,6 +1151,12 @@ const TOOLS: Tool[] = [
           description: "Optional API key override.",
         },
       },
+      anyOf: [
+        { required: ["resume_text"] },
+        { required: ["file_base64"] },
+        { required: ["file_path"] },
+        { required: ["resume_data"] },
+      ],
     },
     outputSchema: {
       type: "object",
@@ -1285,9 +1395,31 @@ export const createMcpServer = (sessionAuth: SessionAuthState) => {
     const sanitizedArgs: Record<string, any> = { ...(args || {}) };
     if (sanitizedArgs.password) sanitizedArgs.password = "***";
     if (sanitizedArgs.code) sanitizedArgs.code = "***";
+    if (sanitizedArgs.email) sanitizedArgs.email = "[redacted email]";
+    if (sanitizedArgs.identifier) sanitizedArgs.identifier = "[redacted account identifier]";
+    if (sanitizedArgs.username) sanitizedArgs.username = "[redacted username]";
+    if (sanitizedArgs.phone_number) sanitizedArgs.phone_number = "[redacted phone number]";
     if (sanitizedArgs.api_key) {
       const k = String(sanitizedArgs.api_key);
       sanitizedArgs.api_key = k.length > 8 ? k.substring(0, 8) + "..." : "***";
+    }
+    if (sanitizedArgs.resume_text !== undefined) {
+      sanitizedArgs.resume_text = `[redacted resume text, ${String(sanitizedArgs.resume_text).length} chars]`;
+    }
+    if (sanitizedArgs.file_base64 !== undefined) {
+      sanitizedArgs.file_base64 = `[redacted document payload, ${String(sanitizedArgs.file_base64).length} chars]`;
+    }
+    if (sanitizedArgs.resume_data !== undefined) {
+      sanitizedArgs.resume_data = "[redacted structured resume data]";
+    }
+    if (sanitizedArgs.file_path !== undefined) {
+      sanitizedArgs.file_path = "[redacted local file path]";
+    }
+    if (sanitizedArgs.job_description !== undefined) {
+      sanitizedArgs.job_description = `[redacted job description, ${String(sanitizedArgs.job_description).length} chars]`;
+    }
+    if (sanitizedArgs.notes !== undefined) {
+      sanitizedArgs.notes = `[redacted user notes, ${String(sanitizedArgs.notes).length} chars]`;
     }
 
     console.log(`[MCP Tool Request] 🛠️  ${name} | Args: ${JSON.stringify(sanitizedArgs)}`);
@@ -1669,17 +1801,8 @@ export const createMcpServer = (sessionAuth: SessionAuthState) => {
           const client = getApiClient(sessionAuth, apiKey);
 
           const form = new FormData();
-          if (args?.file_path) {
-            const filePath = String(args.file_path);
-            if (!fs.existsSync(filePath)) {
-              throw new Error(`File not found: ${filePath}`);
-            }
-            form.append("file", fs.createReadStream(filePath));
-          } else if (args?.file_base64) {
-            const buffer = Buffer.from(String(args.file_base64), "base64");
-            form.append("file", buffer, { filename: String(args?.filename || "resume.pdf") });
-          } else {
-            throw new Error("Either file_path or file_base64 is required.");
+          if (!appendResumeInput(form, args)) {
+            throw new Error("Please provide the resume via 'resume_text' (plain text/markdown), 'file_base64' (Base64 string), or 'file_path'.");
           }
 
           if (args?.language) {
@@ -1700,17 +1823,8 @@ export const createMcpServer = (sessionAuth: SessionAuthState) => {
           const client = getApiClient(sessionAuth, apiKey);
 
           const form = new FormData();
-          if (args?.file_path) {
-            const filePath = String(args.file_path);
-            if (!fs.existsSync(filePath)) {
-              throw new Error(`File not found: ${filePath}`);
-            }
-            form.append("file", fs.createReadStream(filePath));
-          } else if (args?.file_base64) {
-            const buffer = Buffer.from(String(args.file_base64), "base64");
-            form.append("file", buffer, { filename: String(args?.filename || "resume.pdf") });
-          } else {
-            throw new Error("Either file_path or file_base64 is required to tailor CV.");
+          if (!appendResumeInput(form, args)) {
+            throw new Error("Please provide the resume via 'resume_text' (plain text/markdown), 'file_base64' (Base64 string), or 'file_path'.");
           }
 
           form.append("jobDescription", String(args?.job_description || ""));
@@ -1743,21 +1857,18 @@ export const createMcpServer = (sessionAuth: SessionAuthState) => {
           const client = getApiClient(sessionAuth, apiKey);
 
           let resumeData = args?.resume_data;
-          if (!resumeData && args?.file_path) {
-            const filePath = String(args.file_path);
-            if (!fs.existsSync(filePath)) {
-              throw new Error(`File not found: ${filePath}`);
-            }
+          if (!resumeData) {
             const parseForm = new FormData();
-            parseForm.append("file", fs.createReadStream(filePath));
-            const parseRes = await client.post("/v1/external/cvs/parse", parseForm, {
-              headers: parseForm.getHeaders(),
-            });
-            resumeData = parseRes.data?.data || parseRes.data;
+            if (appendResumeInput(parseForm, args)) {
+              const parseRes = await client.post("/v1/external/cvs/parse", parseForm, {
+                headers: parseForm.getHeaders(),
+              });
+              resumeData = parseRes.data?.data || parseRes.data;
+            }
           }
 
           if (!resumeData) {
-            throw new Error("Either resume_data object or file_path document is required to calculate ATS score.");
+            throw new Error("Either resume_data object, resume_text, file_base64, or file_path is required to calculate ATS score.");
           }
 
           const res = await client.post("/v1/external/cvs/score", { resumeData });
@@ -1780,7 +1891,11 @@ export const createMcpServer = (sessionAuth: SessionAuthState) => {
           if (args?.file_path) {
             const filePath = String(args.file_path);
             if (!fs.existsSync(filePath)) {
-              throw new Error(`File not found: ${filePath}`);
+              throw new Error(
+                `File not found on server: "${filePath}".\n` +
+                `Note: This is a remote cloud MCP server and cannot access local files from your sandbox.\n` +
+                `Please provide the resume using 'file_base64' (Base64 encoded string).`
+              );
             }
             form.append("file", fs.createReadStream(filePath));
             defaultOutName = filePath.replace(/\.[^/.]+$/, "_masked.pdf");
@@ -1788,7 +1903,7 @@ export const createMcpServer = (sessionAuth: SessionAuthState) => {
             const buffer = Buffer.from(String(args.file_base64), "base64");
             form.append("file", buffer, { filename: String(args?.filename || "resume.pdf") });
           } else {
-            throw new Error("Either file_path or file_base64 is required.");
+            throw new Error("Either file_base64 or file_path is required.");
           }
 
           const res = await client.post("/v1/external/cvs/mask", form, {
@@ -1970,6 +2085,25 @@ async function runSse(listenPort: number) {
   app.use(cors({ origin: "*" }));
   app.use(express.json());
 
+  const safeRequestTarget = (requestUrl?: string): string => {
+    if (!requestUrl) return "/";
+
+    try {
+      const url = new URL(requestUrl, "http://mcp.local");
+      for (const key of url.searchParams.keys()) {
+        if (/^(?:api_?key|access_?token|auth(?:orization)?|password|code|session_?id)$/i.test(key)) {
+          url.searchParams.set(key, "[redacted]");
+        }
+      }
+      return `${url.pathname}${url.search}`;
+    } catch {
+      return requestUrl.replace(
+        /([?&](?:api_?key|access_?token|auth(?:orization)?|password|code|session_?id)=)[^&]*/gi,
+        "$1[redacted]"
+      );
+    }
+  };
+
   // ─── Traffic Logging Middleware (Observability for Docker/Dokploy) ──
   app.use((req, res, next) => {
     // Skip health probe to avoid polluting logs
@@ -1980,16 +2114,18 @@ async function runSse(listenPort: number) {
       (req.headers["mcp-session-id"] as string) ||
       (req.query.sessionId as string) ||
       "-";
+    const sessionLogLabel = sessionId === "-" ? "-" : "[redacted]";
     const rpcInfo = req.body?.method
       ? `[rpc: ${req.body.method}${req.body?.params?.name ? ` -> ${req.body.params.name}` : ""}]`
       : "";
+    const requestTarget = safeRequestTarget(req.originalUrl || req.url);
 
-    console.log(`[MCP HTTP In] ${req.method} ${req.originalUrl || req.url} ${rpcInfo} (session: ${sessionId})`);
+    console.log(`[MCP HTTP In] ${req.method} ${requestTarget} ${rpcInfo} (session: ${sessionLogLabel})`);
 
     res.on("finish", () => {
       const duration = Date.now() - start;
       console.log(
-        `[MCP HTTP Out] ${req.method} ${req.originalUrl || req.url} ${rpcInfo} → HTTP ${res.statusCode} (${duration}ms)`
+        `[MCP HTTP Out] ${req.method} ${requestTarget} ${rpcInfo} → HTTP ${res.statusCode} (${duration}ms)`
       );
     });
     next();
@@ -2009,7 +2145,7 @@ async function runSse(listenPort: number) {
     const now = Date.now();
     for (const [sid, lastActive] of streamableLastActivity.entries()) {
       if (now - lastActive > SESSION_TTL_MS) {
-        console.log(`[Streamable HTTP] Evicting idle session: ${sid}`);
+        console.log("[Streamable HTTP] Evicting an idle session.");
         const transport = streamableTransports.get(sid);
         if (transport) {
           try {
@@ -2070,26 +2206,19 @@ async function runSse(listenPort: number) {
   });
 
   const handleSse = async (req: express.Request, res: express.Response) => {
-    const initialKey =
-      (req.headers["x-api-key"] as string) ||
-      (req.headers["authorization"]?.replace(/^Bearer\s+/i, "") as string) ||
-      (req.query.apiKey as string) ||
-      undefined;
+    const sessionAuth = getInitialSessionAuth(req);
 
     const transport = new SSEServerTransport("/messages", res);
     const sessionId = transport.sessionId;
 
-    const sessionAuth: SessionAuthState = {
-      apiKey: initialKey,
-    };
     sseTransports.set(sessionId, transport);
 
     transport.onclose = () => {
       sseTransports.delete(sessionId);
-      console.log(`[SSE] Session closed: ${sessionId}`);
+      console.log("[SSE] Session closed.");
     };
 
-    console.log(`[SSE] Session started: ${sessionId} (initial key: ${initialKey ? "provided" : "none"})`);
+    console.log(`[SSE] Session started (initial credentials: ${sessionAuth.apiKey || sessionAuth.accessToken ? "provided" : "none"})`);
     const server = createMcpServer(sessionAuth);
     await server.connect(transport);
   };
@@ -2119,8 +2248,8 @@ async function runSse(listenPort: number) {
     });
   });
 
-  // ─── Legacy SSE POST handler (/messages, /sse, /) ──────────────
-  app.post(["/messages", "/sse", "/"], async (req, res) => {
+  // ─── Legacy SSE POST handler (/messages, /sse) ──────────────
+  app.post(["/messages", "/sse"], async (req, res) => {
     const sessionId = String(req.query.sessionId || req.body?.sessionId || "");
     const transport = sseTransports.get(sessionId);
 
@@ -2136,10 +2265,13 @@ async function runSse(listenPort: number) {
     await transport.handlePostMessage(req, res);
   });
 
-  // ─── Streamable HTTP Transport (/mcp) ─────────────────────────────
-  // New MCP standard — used by Claude Desktop connectors, modern agents.
-  // Each initialize request creates a new per-session Server + Transport.
-  app.post("/mcp", async (req, res) => {
+  // ─── Streamable HTTP Transport (/mcp and /) ─────────────────────
+  // Supports both standard /mcp and root / so agents configured with https://mcp.civify.cv initialize seamlessly
+  app.post(["/mcp", "/"], async (req, res) => {
+    // If a legacy SSE client posted to /?sessionId=...
+    if (req.path === "/" && req.query.sessionId && sseTransports.has(String(req.query.sessionId))) {
+      return sseTransports.get(String(req.query.sessionId))!.handlePostMessage(req, res);
+    }
     try {
       const sessionId = req.headers["mcp-session-id"] as string | undefined;
       let transport: StreamableHTTPServerTransport | undefined;
@@ -2161,12 +2293,7 @@ async function runSse(listenPort: number) {
         return;
       } else if (!sessionId && isInitializeRequest(req.body)) {
         // ── New initialize request — create session ──
-        const initialKey =
-          (req.headers["x-api-key"] as string) ||
-          (req.headers["authorization"]?.replace(/^Bearer\s+/i, "") as string) ||
-          undefined;
-
-        const sessionAuth: SessionAuthState = { apiKey: initialKey };
+        const sessionAuth = getInitialSessionAuth(req);
 
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
@@ -2174,7 +2301,7 @@ async function runSse(listenPort: number) {
             streamableTransports.set(newSessionId, transport!);
             streamableSessionAuths.set(newSessionId, sessionAuth);
             streamableLastActivity.set(newSessionId, Date.now());
-            console.log(`[Streamable HTTP] Session initialized: ${newSessionId} (key: ${initialKey ? "provided" : "none"})`);
+            console.log(`[Streamable HTTP] Session initialized (credentials: ${sessionAuth.apiKey || sessionAuth.accessToken ? "provided" : "none"})`);
           },
         });
 
@@ -2184,7 +2311,7 @@ async function runSse(listenPort: number) {
             streamableTransports.delete(sid);
             streamableSessionAuths.delete(sid);
             streamableLastActivity.delete(sid);
-            console.log(`[Streamable HTTP] Session closed: ${sid}`);
+            console.log("[Streamable HTTP] Session closed.");
           }
         };
 
@@ -2235,7 +2362,7 @@ async function runSse(listenPort: number) {
   });
 
   // Streamable HTTP DELETE — session termination
-  app.delete("/mcp", async (req, res) => {
+  app.delete(["/mcp", "/"], async (req, res) => {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
     if (sessionId && streamableTransports.has(sessionId)) {
       const transport = streamableTransports.get(sessionId)!;
@@ -2243,7 +2370,7 @@ async function runSse(listenPort: number) {
       streamableTransports.delete(sessionId);
       streamableSessionAuths.delete(sessionId);
       streamableLastActivity.delete(sessionId);
-      console.log(`[Streamable HTTP] Session terminated by client: ${sessionId}`);
+      console.log("[Streamable HTTP] Session terminated by client.");
     } else {
       res.status(404).json({ error: "Session not found" });
     }
