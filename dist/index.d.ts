@@ -16,18 +16,23 @@
  * - Complete end-to-end flow: Scraping -> Parsing -> ATS Scoring -> Tailoring -> PII Masking -> PDF Export -> Pay-Per-CV -> Tracking
  */
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { Tool } from "@modelcontextprotocol/sdk/types.js";
 /**
  * Session Authentication State
  * Maintained per connection (CLI stdio or per-session SSE)
  */
 export interface SessionAuthState {
+    remote?: boolean;
+    oauth?: boolean;
+    ephemeral?: boolean;
     apiKey?: string;
     accessToken?: string;
     refreshToken?: string;
     pending2faUsername?: string;
     userProfile?: any;
 }
-export declare const createMcpServer: (sessionAuth: SessionAuthState) => Server<{
+export declare const advertisedTools: (auth: SessionAuthState) => Tool[];
+export declare const createMcpServer: (initialSessionAuth: SessionAuthState) => Server<{
     method: string;
     params?: {
         [x: string]: unknown;

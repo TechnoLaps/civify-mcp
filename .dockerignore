@@ -8,3 +8,6 @@ Dockerfile*
 docker-compose*
 README.md
 .github
+data
+*.enc
+*.enc.tmp

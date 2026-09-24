@@ -31,10 +31,10 @@ jobs:
           node-version: 22
           cache: 'npm'
 
-      - name: Install dependencies & verify compile
+      - name: Install dependencies & run regression tests
         run: |
           npm ci
-          npm run build
+          npm test
 
       # 3. Log in to GitHub Container Registry
       - name: Log in to GitHub Container Registry
@@ -65,7 +65,7 @@ jobs:
           WEBHOOK_URL="${{ secrets.DOKPLOY_WEBHOOK_MCP || secrets.DOKPLOY_WEBHOOK || secrets.DOKPLOY_WEBHOOK_URL }}"
           if [ -n "$WEBHOOK_URL" ]; then
             echo "Triggering Dokploy deployment webhook..."
-            curl -X POST "$WEBHOOK_URL" \
+            curl --fail --silent --show-error --max-time 30 -X POST "$WEBHOOK_URL" \
               -H "Content-Type: application/json" \
               -d "{\"image\": \"${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}\"}"
             echo "Dokploy deployment triggered successfully!"

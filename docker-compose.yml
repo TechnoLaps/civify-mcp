@@ -15,8 +15,14 @@ services:
       - PORT=8080
       - TRANSPORT=sse
       - CIVIFY_API_URL=https://civify.cv/apis
-      # CIVIFY_API_KEY can be optionally provided here or dynamically passed by agents via headers/query
-      - CIVIFY_API_KEY=${CIVIFY_API_KEY:-}
+      # Enable browser OAuth for ChatGPT; store key must be stable across deploys.
+      - CIVIFY_MCP_PUBLIC_URL=https://mcp.civify.cv
+      - CIVIFY_OAUTH_STORE_KEY=${CIVIFY_OAUTH_STORE_KEY:?Set a stable base64-encoded 32-byte encryption key}
+      - CIVIFY_OAUTH_STORE_PATH=/app/data/oauth.enc
+      # Exactly one trusted Traefik hop; do not expose the container port directly.
+      - CIVIFY_TRUST_PROXY_HOPS=1
+    volumes:
+      - civify-mcp-data:/app/data
     networks:
       - dokploy-network
     labels:
@@ -33,3 +39,6 @@ services:
 networks:
   dokploy-network:
     external: true
+
+volumes:
+  civify-mcp-data:

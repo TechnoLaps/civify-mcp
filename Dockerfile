@@ -37,7 +37,8 @@ ENV DNS_SERVERS=8.8.8.8,1.1.1.1
 
 # Create non-root user for security
 RUN addgroup -g 1001 -S nodejs && \
-    adduser -S nodejs -u 1001
+    adduser -S nodejs -u 1001 && \
+    mkdir -p /app/data && chown nodejs:nodejs /app/data
 
 # Copy only production dependencies and compiled artifacts from builder
 COPY --from=builder --chown=nodejs:nodejs /app/node_modules ./node_modules
