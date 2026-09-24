@@ -42,17 +42,19 @@ const call = (server, name, args = {}, auth = {}, route) => rpc(server, { jsonrp
 
 test('transport, backend contracts, account isolation and OAuth regression', { timeout: 120000 }, async t => {
   const requests = [];
+  let failPdf = false;
   const mock = http.createServer(async (req, res) => {
     const chunks = []; for await (const chunk of req) chunks.push(chunk);
     const body = Buffer.concat(chunks).toString();
-    requests.push({ url: req.url, key: req.headers['x-api-key'], body, authorization: req.headers.authorization });
+    requests.push({ url: req.url, key: req.headers['x-api-key'], body, authorization: req.headers.authorization, requestId: req.headers['x-request-id'], tool: req.headers['x-civify-mcp-tool'], contentType: req.headers['content-type'] });
+    if (failPdf && req.url.includes('generate-pdf')) { res.statusCode = 503; res.end('renderer down'); return; }
     if (req.url.includes('generate-pdf') || req.url.endsWith('/mask')) { res.end('%PDF-fixture'); return; }
     res.setHeader('content-type', 'application/json');
     if (req.headers['x-api-key'] === 'cv-fy-invalid') { res.statusCode = 401; res.end(JSON.stringify({ secret: 'upstream-private-error' })); return; }
     if (req.url.endsWith('/user/profile')) res.end(JSON.stringify({ user: req.headers['x-api-key'] }));
-    else if (req.url.endsWith('/parse')) res.end(JSON.stringify({ success: true, resumeData: { personalInfo: { name: 'Fixture' } } }));
+    else if (req.url.endsWith('/parse')) res.end(JSON.stringify({ success: true, resumeData: { personalInfo: { fullName: 'Fixture' }, sections: [] } }));
     else if (req.url.endsWith('/score')) res.end(JSON.stringify({ success: true, data: { overallScore: 85 } }));
-    else if (req.url.endsWith('/tailor')) res.end(JSON.stringify({ success: true, tailoredCv: { personalInfo: { name: 'Candidate مرشح' }, summary: 'A tailored summary.' }, atsScore: { overallScore: 90 } }));
+    else if (req.url.endsWith('/tailor')) res.end(JSON.stringify({ success: true, tailoredCv: { personalInfo: { fullName: 'Candidate مرشح', phone: null, summary: 'A tailored summary.' }, sections: [] }, atsScore: { overallScore: 90 } }));
     else res.end(JSON.stringify({ success: true }));
   });
   mock.listen(0, '127.0.0.1'); await once(mock, 'listening');
@@ -80,10 +82,10 @@ test('transport, backend contracts, account isolation and OAuth regression', { t
   await t.test('per-request credentials work, isolation and scoring unwrap', async () => {
     const auth = { 'x-api-key': 'cv-fy-alice' };
     const parsed = await call(server, 'civify_parse_cv', { resume_text: 'private-resume-fixture', language: 'en' }, auth);
-    assert.equal(parsed.data.result.structuredContent.data.resumeData.personalInfo.name, 'Fixture');
+    assert.equal(parsed.data.result.structuredContent.data.resumeData.personalInfo.fullName, 'Fixture');
     await call(server, 'civify_score_ats', { resume_text: 'fixture' }, auth);
     const score = requests.findLast(r => r.url.endsWith('/score'));
-    assert.deepEqual(JSON.parse(score.body), { resumeData: { personalInfo: { name: 'Fixture' } } });
+    assert.deepEqual(JSON.parse(score.body), { resumeData: { personalInfo: { fullName: 'Fixture' }, sections: [] } });
     const [alice, bob, anonymous] = await Promise.all([
       call(server, 'civify_get_account', {}, { 'x-api-key': 'cv-fy-alice', 'mcp-session-id': sid }),
       call(server, 'civify_get_account', {}, { 'x-api-key': 'cv-fy-bob', 'mcp-session-id': sid }),
@@ -109,7 +111,7 @@ test('transport, backend contracts, account isolation and OAuth regression', { t
     const unknown = await rpc(server, init, { 'mcp-session-id': 'expired' }); assert.equal(unknown.response.status, 404);
   });
   await t.test('remote PDFs return bytes; files, invalid inputs and secrets are contained', async () => {
-    const pdf = await call(server, 'civify_generate_pdf', { resume_data: { personalInfo: {} } });
+    const pdf = await call(server, 'civify_generate_pdf', { resume_data: { personalInfo: {}, sections: [] } });
     assert.equal(Buffer.from(pdf.data.result.structuredContent.data.pdf_base64, 'base64').toString(), '%PDF-fixture');
     const bad = await call(server, 'civify_generate_pdf', { resume_data: {}, output_path: 'forbidden.pdf' });
     assert.equal(bad.data.result.isError, true);
@@ -187,6 +189,12 @@ test('transport, backend contracts, account isolation and OAuth regression', { t
     assert.equal(result.isError, undefined);
     assert.equal(requests.filter(item => item.url.endsWith('/parse')).length, before, 'Tailoring should not add a separate parse request');
     assert.match(requests.findLast(item => item.url.endsWith('/tailor')).body, /Candidate مرشح/);
+    assert.ok(result.structuredContent.data.document.download_url, 'Tailoring delivers the finished PDF by default');
+    const tailRequest = requests.findLast(item => item.url.endsWith('/tailor'));
+    const exportRequest = requests.findLast(item => item.url.includes('generate-pdf'));
+    assert.equal(tailRequest.requestId, result.structuredContent.data.request_id);
+    assert.equal(exportRequest.requestId, tailRequest.requestId);
+    assert.equal(tailRequest.tool, 'civify_tailor_cv');
     const resume = result.structuredContent.data.tailoredCv;
     const scored = await client.callTool({ name: 'civify_score_ats', arguments: { resume_data: resume } });
     assert.equal(scored.isError, undefined);
@@ -201,6 +209,35 @@ test('transport, backend contracts, account isolation and OAuth regression', { t
     assert.equal(tracked.isError, undefined);
     assert.ok(!secured.logs().includes(new URL(link.uri).pathname));
     await client.close();
+  });
+  await t.test('structured tailoring skips parsing; export failure preserves paid result and retries export only', async () => {
+    const auth = { authorization: `Bearer ${tokens.access_token}` };
+    const resume = { personalInfo: { fullName: 'Fixture' }, sections: [] };
+    const parseCount = requests.filter(item => item.url.endsWith('/parse')).length;
+    failPdf = true;
+    let result;
+    try { result = await call(secured, 'civify_tailor_cv', { resume_data: resume, job_description: 'Developer' }, auth); }
+    finally { failPdf = false; }
+    assert.equal(result.data.result.isError, undefined);
+    const data = result.data.result.structuredContent.data;
+    assert.ok(data.tailoredCv);
+    assert.equal(data.document.status, 'EXPORT_FAILED');
+    assert.equal(data.document.retry_tool, 'civify_generate_pdf');
+    const tailor = requests.findLast(item => item.url.endsWith('/tailor'));
+    assert.match(tailor.contentType, /application\/json/);
+    assert.deepEqual(JSON.parse(tailor.body).resumeData, resume);
+    assert.equal(requests.filter(item => item.url.endsWith('/parse')).length, parseCount);
+    const tailorCount = requests.filter(item => item.url.endsWith('/tailor')).length;
+    const pdf = await call(secured, 'civify_generate_pdf', { resume_data: data.tailoredCv });
+    assert.ok(pdf.data.result.structuredContent.data.download_url);
+    assert.equal(requests.filter(item => item.url.endsWith('/tailor')).length, tailorCount);
+    const count = requests.length;
+    const ambiguous = await call(secured, 'civify_tailor_cv', { resume_data: resume, resume_text: 'duplicate', job_description: 'Developer' }, auth);
+    assert.equal(ambiguous.data.result.isError, true);
+    assert.equal(requests.length, count);
+    const noExport = await call(secured, 'civify_tailor_cv', { resume_data: resume, job_description: 'Developer', export_pdf: false }, auth);
+    assert.equal(noExport.data.result.structuredContent.data.document.status, 'NOT_REQUESTED');
+    assert.ok(!secured.logs().includes('Candidate مرشح'));
   });
   await t.test('OAuth survives restart, binds resource, rotates refresh and revokes grant', async () => {
     assert.ok(tokens?.refresh_token);
