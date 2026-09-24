@@ -27,6 +27,7 @@ This release has local regression coverage; it has not been deployed by this cha
 | `CIVIFY_API_URL` | `https://civify.cv/apis` | Backend base URL |
 | `CIVIFY_FRONTEND_URL` | `https://civify.cv` | PDF-rendering service |
 | `CIVIFY_MCP_PUBLIC_URL` | unset | Public HTTPS origin; enables OAuth |
+| `CIVIFY_DOWNLOAD_BASE_URL` | OAuth public origin | Public HTTPS origin for temporary PDF links; can be configured independently |
 | `CIVIFY_OAUTH_STORE_KEY` | unset | Required with OAuth: base64-encoded 32 random bytes |
 | `CIVIFY_OAUTH_STORE_PATH` | `./data/oauth.enc` | Encrypted OAuth database |
 | `CIVIFY_TRUST_PROXY_HOPS` | `0` | Trusted proxy hop count for OAuth rate limits; Compose uses one Traefik hop |
@@ -37,6 +38,12 @@ and back it up separately. Compose requires it and mounts `/app/data` persistent
 The database uses AES-256-GCM and atomic file replacement. Deploy **one replica**;
 multiple processes require a shared transactional store before scaling. Restarting
 preserves registered clients and tokens but cancels unfinished consent/code flows.
+
+When deploying the Dockerfile directly through Dokploy, enter these settings in
+Dokploy too: Compose environment settings are not inherited by a Dockerfile build.
+After deploying, run `node scripts/check-deployment.mjs`. It performs public,
+read-only checks and exits nonzero when OAuth discovery or PDF links are missing.
+An `UP` health response alone does not establish hosted-client readiness.
 
 OAuth uses authorization-code flow with S256 PKCE, client and resource binding,
 one-use codes, one-hour access tokens, rotating 30-day refresh tokens and revocation.
