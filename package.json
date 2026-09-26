@@ -1,8 +1,10 @@
 {
   "name": "@civify/mcp-server",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "type": "module",
-  "engines": { "node": ">=20.5.0" },
+  "engines": {
+    "node": ">=20.5.0"
+  },
   "description": "Model Context Protocol (MCP) server for Civify AI Career Platform. Enables AI agents to parse resumes, tailor CVs against job descriptions, score ATS compatibility, redact PII, and track job applications.",
   "main": "dist/index.js",
   "bin": {

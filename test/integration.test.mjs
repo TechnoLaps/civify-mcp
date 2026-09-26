@@ -42,6 +42,7 @@ const call = (server, name, args = {}, auth = {}, route) => rpc(server, { jsonrp
 
 test('transport, backend contracts, account isolation and OAuth regression', { timeout: 120000 }, async t => {
   const requests = [];
+  const handoffs = new Map();
   let failPdf = false;
   const mock = http.createServer(async (req, res) => {
     const chunks = []; for await (const chunk of req) chunks.push(chunk);
@@ -50,6 +51,14 @@ test('transport, backend contracts, account isolation and OAuth regression', { t
     if (failPdf && req.url.includes('generate-pdf')) { res.statusCode = 503; res.end('renderer down'); return; }
     if (req.url.includes('generate-pdf') || req.url.endsWith('/mask')) { res.end('%PDF-fixture'); return; }
     res.setHeader('content-type', 'application/json');
+    if (req.url === '/mcp/account-link/exchange') {
+      const input = JSON.parse(body), pending = handoffs.get(input.code);
+      if (!pending || pending.transaction !== input.transaction || pending.challenge !== createHash('sha256').update(input.verifier).digest('base64url')) {
+        res.statusCode = 400; res.end('{}'); return;
+      }
+      handoffs.delete(input.code);
+      res.end(JSON.stringify({ apiKey: 'cv-fy-oauth-user', expiresAt: Date.now() + 30 * 86400_000 })); return;
+    }
     if (req.headers['x-api-key'] === 'cv-fy-invalid') { res.statusCode = 401; res.end(JSON.stringify({ secret: 'upstream-private-error' })); return; }
     if (req.url.endsWith('/user/profile')) res.end(JSON.stringify({ user: req.headers['x-api-key'] }));
     else if (req.url.endsWith('/parse')) res.end(JSON.stringify({ success: true, resumeData: { personalInfo: { fullName: 'Fixture' }, sections: [] } }));
@@ -154,15 +163,31 @@ test('transport, backend contracts, account isolation and OAuth regression', { t
     assert.ok(registration.client_id);
     const verifier = randomBytes(32).toString('base64url');
     const query = new URLSearchParams({ client_id: registration.client_id, response_type: 'code', redirect_uri: 'https://client.example/callback', code_challenge: createHash('sha256').update(verifier).digest('base64url'), code_challenge_method: 'S256', state: 'test-state', resource: origin + '/mcp', scope: 'civify:tools' });
-    const consent = await fetch(origin + '/authorize?' + query); const html = await consent.text();
-    assert.equal(consent.status, 200);
-    const transaction = html.match(/name="transaction" value="([^"]+)"/)[1];
-    const csrf = html.match(/name="csrf" value="([^"]+)"/)[1];
+    const consent = await fetch(origin + '/authorize?' + query, { redirect: 'manual' });
+    assert.equal(consent.status, 302);
+    const destination = new URL(consent.headers.get('location'));
+    assert.equal(destination.origin + destination.pathname, 'https://civify.cv/en/mcp/connect');
+    assert.deepEqual([...destination.searchParams.keys()], ['transaction']);
+    const transaction = destination.searchParams.get('transaction');
     const cookie = consent.headers.get('set-cookie').split(';')[0];
-    const rejectedCsrf = await fetch(origin + '/oauth/consent', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', origin }, body: new URLSearchParams({ transaction, csrf, decision: 'allow', api_key: 'cv-fy-oauth-user' }) });
+    const handoff = await (await fetch(origin + '/oauth/transactions/' + transaction)).json();
+    assert.equal(handoff.clientName, 'Test agent');
+    assert.equal(handoff.verifier, undefined); assert.equal(handoff.csrf, undefined);
+    const backendCode = randomBytes(32).toString('base64url');
+    handoffs.set(backendCode, handoff);
+    const completion = origin + '/oauth/complete?' + new URLSearchParams({ transaction, code: backendCode });
+    const rejectedCsrf = await fetch(completion, { redirect: 'manual' });
     assert.equal(rejectedCsrf.status, 400);
-    const linked = await fetch(origin + '/oauth/consent', { method: 'POST', redirect: 'manual', headers: { 'content-type': 'application/x-www-form-urlencoded', cookie, origin }, body: new URLSearchParams({ transaction, csrf, decision: 'allow', api_key: 'cv-fy-oauth-user' }) });
+    const otherConsent = await fetch(origin + '/authorize?' + query, { redirect: 'manual' });
+    const otherCookie = otherConsent.headers.get('set-cookie').split(';')[0];
+    assert.equal((await fetch(completion, { redirect: 'manual', headers: { cookie: otherCookie } })).status, 400);
+    const cancelled = await fetch(origin + '/oauth/complete?' + new URLSearchParams({ transaction: new URL(otherConsent.headers.get('location')).searchParams.get('transaction'), error: 'access_denied' }), { redirect: 'manual', headers: { cookie: otherCookie } });
+    assert.equal(new URL(cancelled.headers.get('location')).searchParams.get('error'), 'access_denied');
+    const linked = await fetch(completion, { redirect: 'manual', headers: { cookie } });
     assert.equal(linked.status, 302);
+    assert.equal((await fetch(completion, { redirect: 'manual', headers: { cookie } })).status, 400);
+    assert.equal((await fetch(origin + '/oauth/transactions/' + transaction)).status, 404);
+    assert.equal(handoffs.size, 0);
     const redirect = new URL(linked.headers.get('location')); assert.equal(redirect.searchParams.get('state'), 'test-state');
     const grant = { grant_type: 'authorization_code', code: redirect.searchParams.get('code'), code_verifier: verifier, redirect_uri: 'https://client.example/callback', resource: origin + '/mcp' };
     assert.equal((await tokenRequest({ ...grant, code_verifier: 'wrong' })).status, 400);
@@ -178,6 +203,7 @@ test('transport, backend contracts, account isolation and OAuth regression', { t
     assert.equal((await call(secured, 'civify_get_account', {}, { 'x-api-key': 'cv-fy-oauth-user' })).response.status, 401);
     const encrypted = await readFile(oauthEnv.CIVIFY_OAUTH_STORE_PATH, 'utf8');
     assert.ok(!encrypted.includes('cv-fy-oauth-user')); assert.ok(!secured.logs().includes('cv-fy-oauth-user'));
+    assert.ok(!secured.logs().includes(backendCode));
   });
   await t.test('SDK hosted workflow: attached resume text to tailoring, scoring, downloadable PDF and tracking', async () => {
     const client = new Client({ name: 'cross-client-workflow', version: '1' });

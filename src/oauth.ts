@@ -10,11 +10,10 @@ import { InvalidGrantError, InvalidTokenError, InvalidScopeError, InvalidTargetE
 
 const opaque = () => randomBytes(32).toString("base64url");
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
-const escapeHtml = (value: string) => value.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
 const SCOPE = "civify:tools";
-type Grant = { clientId: string; apiKey: string; expires: number; family: string };
-type Pending = { client: OAuthClientInformationFull; params: AuthorizationParams; csrf: string; expires: number };
-type Code = Pending & { apiKey: string };
+type Grant = { clientId: string; apiKey: string; expires: number; family: string; authorizationExpires?: number };
+type Pending = { client: OAuthClientInformationFull; params: AuthorizationParams; csrf: string; verifier: string; expires: number };
+type Code = Pending & { apiKey: string; authorizationExpires: number };
 type Database = { clients: Record<string, OAuthClientInformationFull>; access: Record<string, Grant>; refresh: Record<string, Grant> };
 
 /** Single-replica encrypted storage. Codes and browser transactions intentionally die on restart. */
@@ -23,8 +22,14 @@ export class CivifyOAuthProvider implements OAuthServerProvider {
   private pending = new Map<string, Pending>();
   private codes = new Map<string, Code>();
   readonly resource: URL;
+  private connectUrl: URL;
   constructor(readonly issuer: URL, private apiUrl: string, private storePath: string, private key: Buffer) {
     this.resource = new URL("/mcp", issuer);
+    this.connectUrl = new URL(process.env.CIVIFY_ACCOUNT_CONNECT_URL || "https://civify.cv/en/mcp/connect");
+    if (this.connectUrl.username || this.connectUrl.password || this.connectUrl.hash ||
+        (this.connectUrl.protocol !== "https:" && !(this.connectUrl.protocol === "http:" && ["localhost", "127.0.0.1"].includes(this.connectUrl.hostname)))) {
+      throw new Error("CIVIFY_ACCOUNT_CONNECT_URL requires HTTPS (or loopback HTTP).");
+    }
     if (key.length !== 32) throw new Error("CIVIFY_OAUTH_STORE_KEY must encode exactly 32 random bytes as base64.");
     if (fs.existsSync(storePath)) {
       const encrypted = Buffer.from(fs.readFileSync(storePath, "utf8"), "base64");
@@ -77,35 +82,55 @@ export class CivifyOAuthProvider implements OAuthServerProvider {
     if (this.pending.size >= 1000) throw new InvalidGrantError("Too many pending authorizations.");
     const id = opaque();
     const csrf = opaque();
-    this.pending.set(id, { client, params, csrf, expires: Date.now() + 10 * 60_000 });
-    res.cookie("civify_oauth", csrf, { httpOnly: true, secure: this.issuer.protocol === "https:", sameSite: "lax", path: "/oauth/consent", maxAge: 600_000 });
+    this.pending.set(id, { client, params, csrf, verifier: opaque(), expires: Date.now() + 10 * 60_000 });
+    res.cookie(`civify_oauth_${id}`, csrf, { httpOnly: true, secure: this.issuer.protocol === "https:", sameSite: "lax", path: "/oauth/complete", maxAge: 600_000 });
     res.set({ "Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY", "Content-Security-Policy": "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'" });
-    res.type("html").send(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Connect Civify</title><h1>Connect your Civify account</h1><p>Client: <strong>${escapeHtml(client.client_name || client.client_id)}</strong></p><p>Return address: ${escapeHtml(params.redirectUri)}</p><p>This grants access to your profile, resumes, AI tools, applications and purchase initiation within your API key's permissions. AI operations can consume credits. Payments require checkout.</p><p>Create a dedicated, scoped API key in your <a href="https://civify.cv/en/app/api-keys" target="_blank" rel="noopener noreferrer">Civify account</a>. Enter it here, never in the agent conversation. Revoke the key in Civify to disconnect access.</p><form method="post" action="/oauth/consent"><input type="hidden" name="transaction" value="${id}"><input type="hidden" name="csrf" value="${csrf}"><label>Civify API key <input type="password" name="api_key" required autocomplete="off" maxlength="512"></label><button name="decision" value="allow">Connect Civify</button><button name="decision" value="deny" formnovalidate>Cancel</button></form></html>`);
+    const destination = new URL(this.connectUrl);
+    destination.searchParams.set("transaction", id);
+    res.redirect(destination.href);
   }
-  consent = async (req: express.Request, res: express.Response) => {
-    res.set("Cache-Control", "no-store");
-    const id = String(req.body?.transaction || "");
+  // Public, unguessable request handle. No user data, browser secret or verifier is exposed.
+  transaction = (req: express.Request, res: express.Response) => {
+    res.set({ "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" });
+    const id = String(req.params.id || "");
     const pending = this.pending.get(id);
-    const cookie = req.headers.cookie?.split(";").map(s => s.trim()).find(s => s.startsWith("civify_oauth="))?.slice(13);
-    if (!pending || pending.expires <= Date.now() || req.body.csrf !== pending.csrf || cookie !== pending.csrf || req.get("origin") !== this.issuer.origin) {
+    if (!pending || pending.expires <= Date.now()) { res.status(404).json({ error: "Authorization expired. Reconnect from your client." }); return; }
+    res.json({ transaction: id, clientName: pending.client.client_name || "AI client", redirectUri: pending.params.redirectUri,
+      challenge: createHash("sha256").update(pending.verifier).digest("base64url"), expiresAt: pending.expires });
+  };
+  complete = async (req: express.Request, res: express.Response) => {
+    res.set({ "Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY" });
+    const id = typeof req.query.transaction === "string" ? req.query.transaction : "";
+    const pending = this.pending.get(id);
+    const cookieName = `civify_oauth_${id}=`;
+    const cookie = req.headers.cookie?.split(";").map(s => s.trim()).find(s => s.startsWith(cookieName))?.slice(cookieName.length);
+    if (!pending || pending.expires <= Date.now() || cookie !== pending.csrf) {
       res.status(400).send("Authorization expired or invalid. Restart account linking from your MCP client."); return;
     }
     // Consume before awaiting the backend: one browser submission per authorization.
     this.pending.delete(id);
+    res.clearCookie(`civify_oauth_${id}`, { path: "/oauth/complete" });
     const redirect = new URL(pending.params.redirectUri);
     if (pending.params.state !== undefined) redirect.searchParams.set("state", pending.params.state);
-    if (req.body.decision !== "allow") {
+    if (req.query.error === "access_denied") {
       redirect.searchParams.set("error", "access_denied"); res.redirect(redirect.href); return;
     }
-    const apiKey = String(req.body.api_key || "").trim();
+    let apiKey: string;
+    let authorizationExpires: number;
     try {
-      if (!apiKey.startsWith("cv-fy-")) throw new Error("Invalid key");
-      await axios.get(`${this.apiUrl}/v1/external/cvs/user/profile`, { headers: { "X-API-KEY": apiKey }, timeout: 15000, maxRedirects: 0 });
+      if (typeof req.query.code !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(req.query.code)) throw new Error("Invalid code");
+      const exchanged = await axios.post(`${this.apiUrl}/mcp/account-link/exchange`,
+        { code: req.query.code, verifier: pending.verifier, transaction: id }, { timeout: 15000, maxRedirects: 0 });
+      apiKey = exchanged.data.apiKey;
+      if (typeof apiKey !== "string" || !apiKey.startsWith("cv-fy-")) throw new Error("Invalid grant");
+      authorizationExpires = exchanged.data.expiresAt;
+      if (!Number.isFinite(authorizationExpires) || authorizationExpires <= Date.now()) throw new Error("Expired grant");
     } catch {
-      res.status(400).send("Unable to validate the key. Check account:read permission and restart account linking."); return;
+      // Never log the upstream response: it may contain credentials.
+      res.status(400).send("Unable to complete Civify account linking. Restart from your MCP client and sign in again."); return;
     }
     const code = opaque();
-    this.codes.set(hash(code), { ...pending, apiKey, expires: Date.now() + 60_000 });
+    this.codes.set(hash(code), { ...pending, apiKey, authorizationExpires, expires: Date.now() + 60_000 });
     redirect.searchParams.set("code", code);
     res.redirect(redirect.href);
   };
@@ -122,21 +147,24 @@ export class CivifyOAuthProvider implements OAuthServerProvider {
     const value = this.getCode(client, code);
     if (redirectUri !== value.params.redirectUri) throw new InvalidGrantError("Redirect URI mismatch.");
     this.codes.delete(hash(code));
-    return this.issue(client.client_id, value.apiKey, opaque());
+    return this.issue(client.client_id, value.apiKey, opaque(), value.authorizationExpires);
   }
-  private issue(clientId: string, apiKey: string, family: string): OAuthTokens {
+  private issue(clientId: string, apiKey: string, family: string, authorizationExpires = Date.now() + 30 * 86400_000): OAuthTokens {
+    if (authorizationExpires <= Date.now()) throw new InvalidGrantError("Account connection expired; reconnect Civify.");
     const access = opaque(), refresh = opaque();
-    this.db.access[hash(access)] = { clientId, apiKey, family, expires: Date.now() + 3600_000 };
-    this.db.refresh[hash(refresh)] = { clientId, apiKey, family, expires: Date.now() + 30 * 86400_000 };
+    const expiresIn = Math.min(3600, Math.floor((authorizationExpires - Date.now()) / 1000));
+    if (expiresIn < 1) throw new InvalidGrantError("Account connection expired; reconnect Civify.");
+    this.db.access[hash(access)] = { clientId, apiKey, family, authorizationExpires, expires: Date.now() + expiresIn * 1000 };
+    this.db.refresh[hash(refresh)] = { clientId, apiKey, family, authorizationExpires, expires: Math.min(Date.now() + 30 * 86400_000, authorizationExpires) };
     this.save();
-    return { access_token: access, token_type: "Bearer", expires_in: 3600, refresh_token: refresh, scope: SCOPE };
+    return { access_token: access, token_type: "Bearer", expires_in: expiresIn, refresh_token: refresh, scope: SCOPE };
   }
   async exchangeRefreshToken(client: OAuthClientInformationFull, token: string, scopes?: string[], resource?: URL) {
     this.checkResource(resource); this.checkScopes(scopes);
     const grant = this.db.refresh[hash(token)];
     if (!grant || grant.expires <= Date.now() || grant.clientId !== client.client_id) throw new InvalidGrantError("Invalid refresh token; reconnect Civify.");
     delete this.db.refresh[hash(token)];
-    return this.issue(grant.clientId, grant.apiKey, grant.family);
+    return this.issue(grant.clientId, grant.apiKey, grant.family, grant.authorizationExpires);
   }
   async verifyAccessToken(token: string) {
     const grant = this.db.access[hash(token)];
@@ -160,6 +188,7 @@ export function installOAuth(app: express.Express, apiUrl: string) {
   app.use(mcpAuthRouter({ provider, issuerUrl: issuer, resourceServerUrl: provider.resource, scopesSupported: [SCOPE], resourceName: "Civify" }));
   // Older remote clients discover metadata at the origin instead of /mcp.
   app.get("/.well-known/oauth-protected-resource", (_req, res) => res.json({ resource: provider.resource.href, authorization_servers: [issuer.href], scopes_supported: [SCOPE] }));
-  app.post("/oauth/consent", express.urlencoded({ extended: false, limit: "8kb" }), provider.consent);
+  app.get("/oauth/transactions/:id", provider.transaction);
+  app.get("/oauth/complete", provider.complete);
   return provider;
 }

@@ -238,7 +238,7 @@ const CIVIFY_BASE_URL = process.env.CIVIFY_API_URL || "https://civify.cv/apis";
 const CIVIFY_FRONTEND_URL = process.env.CIVIFY_FRONTEND_URL || "https://civify.cv";
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : null;
 const IS_SSE = process.argv.includes("--sse") || process.env.TRANSPORT === "sse" || PORT !== null;
-const SERVER_VERSION = "1.4.0";
+const SERVER_VERSION = "1.5.0";
 const requestAuth = new AsyncLocalStorage();
 const toolTrace = new AsyncLocalStorage();
 const traceHeaders = () => {
@@ -271,10 +271,11 @@ const ensureAuthenticated = (sessionAuth, overrideKey) => {
     const key = overrideKey || sessionAuth.apiKey;
     if (!key && !sessionAuth.accessToken) {
         throw new Error("UNAUTHENTICATED: No active Civify credentials found for this session.\n" +
-            (sessionAuth.remote ? "Connect your account through the client's OAuth flow. For API-key clients, configure X-API-KEY securely on every request. Do not paste credentials into chat." : "To authenticate, please perform one of the following:\n" +
-                "1. Sign in with your Civify account using the 'civify_login' tool (email & password).\n" +
-                "2. Provide your existing API key using the 'civify_set_api_key' tool (starts with 'cv-fy-').\n" +
-                "3. If you do not have an account yet, create one using the 'civify_register' tool."));
+            (sessionAuth.remote
+                ? (sessionAuth.oauth ? "Connect your account through the client's OAuth flow and sign in to Civify in the browser."
+                    : "This hosted server has OAuth disabled. ChatGPT needs the server operator to enable OAuth, then you must reconnect. Clients that support custom headers may configure X-API-KEY securely in their connection settings.")
+                : "Configure CIVIFY_API_KEY in your trusted local client environment, or use the hosted OAuth connection.") +
+            " Do not paste passwords or API keys into chat.");
     }
     return key || "";
 };
@@ -1448,9 +1449,9 @@ export const createMcpServer = (initialSessionAuth) => {
             const executeTool = async () => {
                 switch (name) {
                     case "civify_get_started": return { content: [{ type: "text", text: JSON.stringify({
-                                    account_url: "https://civify.cv/en/app/api-keys", docs_url: "https://civify.cv/mcp-docs",
+                                    account_url: sessionAuth.oauth ? "https://civify.cv/en/login" : "https://civify.cv/en/app/api-keys", docs_url: "https://civify.cv/mcp-docs",
                                     workflow: ["Connect account securely", "Check account credits", "Use extracted resume_data directly, or send the original to tailoring; parsing is optional", "Return document.download_url from tailoring or download_url from masking/export", "Track application when requested"],
-                                    authentication: sessionAuth.oauth ? "Use your MCP client's OAuth account connection." : "Configure X-API-KEY in a trusted client; local stdio also supports CIVIFY_API_KEY.",
+                                    authentication: sessionAuth.oauth ? "Use your MCP client's Connect account action, sign in to Civify in the browser, and approve access. No API key is needed from the user. Never ask for passwords or credentials in chat." : "This server has OAuth disabled. ChatGPT requires the server operator to enable OAuth. Trusted clients with header support may configure X-API-KEY; local stdio supports CIVIFY_API_KEY. Never ask for credentials in chat.",
                                     inputs: sessionAuth.remote ? ["file (native ChatGPT attachment)", "file_url (real public HTTPS download URL)", "resume_text (complete extracted text)", "file_base64 with filename"] : ["resume_text", "file_base64 with filename", "file_path"],
                                     attachment_guidance: "Use the actual attached CV. If you can extract its data accurately, send canonical resume_data to tailor, score or generate_pdf; no parse call is needed. Otherwise prefer file when the client supplies it, or send complete resume_text. Never invent URLs, sandbox paths, base64 or missing CV details. Parsing is an optional extraction service when you cannot produce the schema. Masking accepts the original so Civify can identify PII.",
                                     resume_data_example: { personalInfo: { fullName: "Candidate Name", summary: "Use only facts from the supplied CV" }, sections: [{ id: "experience", title: "Experience", type: "experience", order: 0, visible: true, items: [{ id: "role-1", title: "Employer", subtitle: "Role", date: "Dates from CV", description: "Actual responsibilities and achievements", visible: true }] }] },
@@ -2015,17 +2016,19 @@ async function runSse(listenPort) {
             return "/";
         if (requestUrl.startsWith("/downloads/"))
             return "/downloads/[redacted]";
+        if (requestUrl.startsWith("/oauth/transactions/"))
+            return "/oauth/transactions/[redacted]";
         try {
             const url = new URL(requestUrl, "http://mcp.local");
             for (const key of url.searchParams.keys()) {
-                if (/^(?:api_?key|access_?token|auth(?:orization)?|password|code|session_?id)$/i.test(key)) {
+                if (/^(?:api_?key|access_?token|auth(?:orization)?|password|code|session_?id|transaction|verifier|csrf)$/i.test(key)) {
                     url.searchParams.set(key, "[redacted]");
                 }
             }
             return `${url.pathname}${url.search}`;
         }
         catch {
-            return requestUrl.replace(/([?&](?:api_?key|access_?token|auth(?:orization)?|password|code|session_?id)=)[^&]*/gi, "$1[redacted]");
+            return requestUrl.replace(/([?&](?:api_?key|access_?token|auth(?:orization)?|password|code|session_?id|transaction|verifier|csrf)=)[^&]*/gi, "$1[redacted]");
         }
     };
     // ─── Traffic Logging Middleware (Observability for Docker/Dokploy) ──

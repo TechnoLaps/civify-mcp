@@ -9,10 +9,12 @@ job-specific tailoring, PII masking, PDF export, pricing, and application tracki
 ## Hosted ChatGPT connection
 
 Use **https://mcp.civify.cv/mcp** with **OAuth** after deploying/configuring this
-release. Account linking opens a browser consent page where the user supplies a
-scoped key from [Civify API keys](https://civify.cv/en/app/api-keys). The key is
-validated by Civify and stored encrypted; ChatGPT receives separate opaque OAuth
-tokens. Never paste passwords or API keys into the agent conversation.
+release together with the backend and frontend account-link changes. Account linking
+opens Civify's normal sign-in (including its existing Google/LinkedIn and two-factor
+flows), then asks the user to approve access. Users do not create or copy API keys.
+A one-time, proof-bound exchange creates a dedicated 30-day scoped backend credential;
+the gateway stores it encrypted and ChatGPT receives separate opaque OAuth tokens.
+Never paste passwords or API keys into the agent conversation.
 
 OAuth requires `CIVIFY_MCP_PUBLIC_URL`, a stable `CIVIFY_OAUTH_STORE_KEY`, and durable
 storage as described below. Existing connections must reconnect after rollout.
@@ -27,6 +29,7 @@ This release has local regression coverage; it has not been deployed by this cha
 | `CIVIFY_API_URL` | `https://civify.cv/apis` | Backend base URL |
 | `CIVIFY_FRONTEND_URL` | `https://civify.cv` | PDF-rendering service |
 | `CIVIFY_MCP_PUBLIC_URL` | unset | Public HTTPS origin; enables OAuth |
+| `CIVIFY_ACCOUNT_CONNECT_URL` | `https://civify.cv/en/mcp/connect` | Civify frontend sign-in/consent page; override only for staging |
 | `CIVIFY_DOWNLOAD_BASE_URL` | OAuth public origin | Public HTTPS origin for temporary PDF links; can be configured independently |
 | `CIVIFY_OAUTH_STORE_KEY` | unset | Required with OAuth: base64-encoded 32 random bytes |
 | `CIVIFY_OAUTH_STORE_PATH` | `./data/oauth.enc` | Encrypted OAuth database |
@@ -41,15 +44,25 @@ preserves registered clients and tokens but cancels unfinished consent/code flow
 
 When deploying the Dockerfile directly through Dokploy, enter these settings in
 Dokploy too: Compose environment settings are not inherited by a Dockerfile build.
-After deploying, run `node scripts/check-deployment.mjs`. It performs public,
+These variables, including the encryption key, belong to the **MCP gateway service**,
+not the Java backend or frontend. The backend account-link service defaults to trusting
+`https://mcp.civify.cv`; staging can override Spring property `civify.mcp.origin`
+with `CIVIFY_MCP_ORIGIN`. Production requires Redis for atomic handoff consumption;
+Redis failures stop linking safely. No additional shared login secret is required.
+
+After deploying, optionally run `node scripts/check-deployment.mjs`. It performs public,
 read-only checks and exits nonzero when OAuth discovery or PDF links are missing.
-An `UP` health response alone does not establish hosted-client readiness.
+It does not enable OAuth, push code or run during tool calls. An `UP` health response
+alone does not establish hosted-client readiness.
 
 OAuth uses authorization-code flow with S256 PKCE, client and resource binding,
-one-use codes, one-hour access tokens, rotating 30-day refresh tokens and revocation.
-The resource is the public `/mcp` URL. Backend key scopes remain authoritative;
-`account:read` is needed for account linking. Users can revoke the underlying key
-in Civify. OAuth account linking currently uses a browser API-key form, not Civify SSO.
+one-use codes, one-hour access tokens, rotating refresh tokens and revocation.
+New account connections expire after 30 days; refresh cannot extend that approval.
+The resource is the public `/mcp` URL. Backend key scopes remain authoritative.
+The browser shows the account, requesting app, registered return address, permissions
+and credit impact. Users can revoke the dedicated `MCP: <client>` entry in Civify's
+account access/API-key settings. Deploy backend → frontend → gateway, then reconnect
+the connector with OAuth selected. Do not select “No authentication” for ChatGPT.
 
 Endpoints:
 

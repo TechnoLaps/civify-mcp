@@ -11,6 +11,7 @@ export declare class CivifyOAuthProvider implements OAuthServerProvider {
     private pending;
     private codes;
     readonly resource: URL;
+    private connectUrl;
     constructor(issuer: URL, apiUrl: string, storePath: string, key: Buffer);
     private save;
     get clientsStore(): {
@@ -62,7 +63,8 @@ export declare class CivifyOAuthProvider implements OAuthServerProvider {
     private checkResource;
     private checkScopes;
     authorize(client: OAuthClientInformationFull, params: AuthorizationParams, res: Response): Promise<void>;
-    consent: (req: express.Request, res: express.Response) => Promise<void>;
+    transaction: (req: express.Request, res: express.Response) => void;
+    complete: (req: express.Request, res: express.Response) => Promise<void>;
     private getCode;
     challengeForAuthorizationCode(client: OAuthClientInformationFull, code: string): Promise<string>;
     exchangeAuthorizationCode(client: OAuthClientInformationFull, code: string, _verifier?: string, redirectUri?: string, resource?: URL): Promise<{
