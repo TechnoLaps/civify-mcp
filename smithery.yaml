@@ -8,5 +8,5 @@ startCommand:
     properties:
       apiKey:
         type: string
-        description: "Optional Civify Developer API key (starts with 'cv-fy-'). You can also sign in interactively in chat using civify_login."
+        description: "Optional Civify Developer API key (starts with 'cv-fy-')."
   url: https://mcp.civify.cv/sse
